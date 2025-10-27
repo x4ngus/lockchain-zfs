@@ -1,3 +1,3 @@
 fn main() {
-println!("lockchain-key-usb: don't forget your LockChain!");
+    println!("lockchain-key-usb: don't forget your LockChain!");
 }

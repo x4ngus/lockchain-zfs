@@ -7,4 +7,5 @@ edition = "2021"
 lockchain-core = { path = "../lockchain-core" }
 lockchain-zfs = { path = "../lockchain-zfs" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros","process"] }
+anyhow = "1"
+rpassword = "7"

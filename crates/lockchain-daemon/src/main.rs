@@ -1,3 +1,3 @@
 fn main() {
-println!("lockchain-daemon: don't forget your LockChain!");
+    println!("lockchain-daemon: don't forget your LockChain!");
 }

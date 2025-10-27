@@ -1,0 +1,390 @@
+use crate::config::LockchainConfig;
+use crate::error::{LockchainError, LockchainResult};
+use crate::provider::{KeyStatusSnapshot, ZfsProvider};
+use hex::FromHex;
+use pbkdf2::pbkdf2_hmac;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use zeroize::Zeroizing;
+
+/// Options that tune the unlock workflow.
+#[derive(Debug, Clone, Default)]
+pub struct UnlockOptions {
+    pub strict_usb: bool,
+    pub fallback_passphrase: Option<String>,
+    pub key_override: Option<Vec<u8>>,
+}
+
+/// Result of an unlock attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlockReport {
+    pub dataset: String,
+    pub encryption_root: String,
+    pub unlocked: Vec<String>,
+    pub already_unlocked: bool,
+}
+
+/// Current key status for a dataset and its encryption root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetStatus {
+    pub dataset: String,
+    pub encryption_root: String,
+    pub root_locked: bool,
+    pub locked_descendants: Vec<String>,
+}
+
+pub struct LockchainService<P: ZfsProvider> {
+    config: Arc<LockchainConfig>,
+    provider: P,
+}
+
+impl<P: ZfsProvider> LockchainService<P> {
+    pub fn new(config: Arc<LockchainConfig>, provider: P) -> Self {
+        Self { config, provider }
+    }
+
+    pub fn unlock(&self, dataset: &str, options: UnlockOptions) -> LockchainResult<UnlockReport> {
+        if !self.config.contains_dataset(dataset) {
+            return Err(LockchainError::DatasetNotConfigured(dataset.to_string()));
+        }
+
+        let root = self.provider.encryption_root(dataset)?;
+        let locked_before = self.provider.locked_descendants(&root)?;
+        if !locked_before.iter().any(|ds| ds == &root) {
+            return Ok(UnlockReport {
+                dataset: dataset.to_string(),
+                encryption_root: root,
+                unlocked: Vec::new(),
+                already_unlocked: true,
+            });
+        }
+
+        let key = self.key_material(dataset, &options)?;
+        let unlocked = self.provider.load_key_tree(&root, &key)?;
+
+        let locked_after = self.provider.locked_descendants(&root)?;
+        if locked_after.iter().any(|ds| ds == &root) {
+            return Err(LockchainError::Provider(format!(
+                "encryption root {} still locked after load-key",
+                root
+            )));
+        }
+
+        Ok(UnlockReport {
+            dataset: dataset.to_string(),
+            encryption_root: root,
+            unlocked,
+            already_unlocked: false,
+        })
+    }
+
+    pub fn status(&self, dataset: &str) -> LockchainResult<DatasetStatus> {
+        if !self.config.contains_dataset(dataset) {
+            return Err(LockchainError::DatasetNotConfigured(dataset.to_string()));
+        }
+
+        let root = self.provider.encryption_root(dataset)?;
+        let locked = self.provider.locked_descendants(&root)?;
+        let root_locked = locked.iter().any(|ds| ds == &root);
+        let locked_descendants: Vec<String> = locked.into_iter().filter(|ds| ds != &root).collect();
+
+        Ok(DatasetStatus {
+            dataset: dataset.to_string(),
+            encryption_root: root,
+            root_locked,
+            locked_descendants,
+        })
+    }
+
+    pub fn list_keys(&self) -> LockchainResult<KeyStatusSnapshot> {
+        self.provider
+            .describe_datasets(&self.config.policy.datasets)
+    }
+
+    fn key_material(
+        &self,
+        dataset: &str,
+        options: &UnlockOptions,
+    ) -> LockchainResult<Zeroizing<Vec<u8>>> {
+        if let Some(raw) = &options.key_override {
+            return Ok(Zeroizing::new(raw.clone()));
+        }
+
+        let usb_key_path = self.config.key_hex_path();
+        match fs::read_to_string(&usb_key_path) {
+            Ok(contents) => {
+                let key = self.decode_hex_key(&usb_key_path, &contents)?;
+                self.verify_checksum(&key)?;
+                return Ok(Zeroizing::new(key));
+            }
+            Err(read_err) => {
+                if options.strict_usb {
+                    return Err(match read_err.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            LockchainError::MissingKeySource(dataset.to_string())
+                        }
+                        _ => LockchainError::Io(read_err),
+                    });
+                }
+
+                if !self.config.fallback.enabled {
+                    return Err(match read_err.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            LockchainError::MissingKeySource(dataset.to_string())
+                        }
+                        _ => LockchainError::Io(read_err),
+                    });
+                }
+            }
+        }
+
+        let passphrase = options
+            .fallback_passphrase
+            .as_ref()
+            .ok_or_else(|| LockchainError::MissingKeySource(dataset.to_string()))?;
+
+        let passphrase = Zeroizing::new(passphrase.clone().into_bytes());
+        let key = self.derive_fallback_key(&passphrase)?;
+        Ok(key)
+    }
+
+    fn decode_hex_key(&self, path: &PathBuf, contents: &str) -> LockchainResult<Vec<u8>> {
+        let filtered: String = contents.split_whitespace().collect::<Vec<_>>().join("");
+        if filtered.is_empty() {
+            return Err(LockchainError::InvalidHexKey {
+                path: path.clone(),
+                reason: "file is empty".to_string(),
+            });
+        }
+
+        Vec::from_hex(&filtered).map_err(|err| LockchainError::InvalidHexKey {
+            path: path.clone(),
+            reason: err.to_string(),
+        })
+    }
+
+    fn verify_checksum(&self, key: &[u8]) -> LockchainResult<()> {
+        if let Some(expected) = &self.config.usb.expected_sha256 {
+            let digest = Sha256::digest(key);
+            let actual = hex::encode(digest);
+            if !expected.eq_ignore_ascii_case(&actual) {
+                return Err(LockchainError::InvalidConfig(format!(
+                    "usb.expected_sha256 mismatch: expected {}, got {}",
+                    expected, actual
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn derive_fallback_key(&self, passphrase: &[u8]) -> LockchainResult<Zeroizing<Vec<u8>>> {
+        let fallback = &self.config.fallback;
+        let salt_hex = fallback.passphrase_salt.as_ref().ok_or_else(|| {
+            LockchainError::InvalidConfig("fallback.passphrase_salt missing".into())
+        })?;
+        let xor_hex = fallback.passphrase_xor.as_ref().ok_or_else(|| {
+            LockchainError::InvalidConfig("fallback.passphrase_xor missing".into())
+        })?;
+
+        let salt = Vec::from_hex(salt_hex).map_err(|err| {
+            LockchainError::InvalidConfig(format!("invalid fallback.passphrase_salt: {}", err))
+        })?;
+        let cipher = Vec::from_hex(xor_hex).map_err(|err| {
+            LockchainError::InvalidConfig(format!("invalid fallback.passphrase_xor: {}", err))
+        })?;
+
+        if cipher.len() != 32 {
+            return Err(LockchainError::InvalidConfig(format!(
+                "fallback.passphrase_xor length must be 32 bytes, got {}",
+                cipher.len()
+            )));
+        }
+
+        let iterations = fallback.passphrase_iters.max(1);
+        let mut derived = Zeroizing::new(vec![0u8; cipher.len()]);
+        pbkdf2_hmac::<Sha256>(passphrase, &salt, iterations, &mut derived);
+
+        let raw: Vec<u8> = cipher
+            .iter()
+            .zip(derived.iter())
+            .map(|(c, d)| c ^ d)
+            .collect();
+
+        Ok(Zeroizing::new(raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CryptoCfg, Fallback, LockchainConfig, Policy, Usb};
+    use crate::provider::{DatasetKeyDescriptor, KeyState, KeyStatusSnapshot, ZfsProvider};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    struct MockProvider {
+        root: String,
+        locked: Mutex<HashSet<String>>,
+        observed_keys: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl MockProvider {
+        fn new(root: &str, locked: &[&str]) -> Self {
+            Self {
+                root: root.to_string(),
+                locked: Mutex::new(locked.iter().map(|s| s.to_string()).collect()),
+                observed_keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ZfsProvider for MockProvider {
+        fn encryption_root(&self, _dataset: &str) -> LockchainResult<String> {
+            Ok(self.root.clone())
+        }
+
+        fn locked_descendants(&self, _root: &str) -> LockchainResult<Vec<String>> {
+            let mut entries: Vec<String> = self.locked.lock().unwrap().iter().cloned().collect();
+            entries.sort();
+            Ok(entries)
+        }
+
+        fn load_key_tree(&self, _root: &str, key: &[u8]) -> LockchainResult<Vec<String>> {
+            self.observed_keys.lock().unwrap().push(key.to_vec());
+            let mut guard = self.locked.lock().unwrap();
+            let mut unlocked: Vec<String> = guard.iter().cloned().collect();
+            unlocked.sort();
+            guard.clear();
+            Ok(unlocked)
+        }
+
+        fn describe_datasets(&self, datasets: &[String]) -> LockchainResult<KeyStatusSnapshot> {
+            let locked = self.locked.lock().unwrap();
+            Ok(datasets
+                .iter()
+                .map(|ds| DatasetKeyDescriptor {
+                    dataset: ds.clone(),
+                    encryption_root: self.root.clone(),
+                    state: if locked.contains(ds) {
+                        KeyState::Unavailable
+                    } else {
+                        KeyState::Available
+                    },
+                })
+                .collect())
+        }
+    }
+
+    fn base_config(key_path: &PathBuf) -> LockchainConfig {
+        LockchainConfig {
+            policy: Policy {
+                datasets: vec!["tank/secure".to_string()],
+                zfs_path: None,
+                binary_path: None,
+                allow_root: false,
+            },
+            crypto: CryptoCfg { timeout_secs: 5 },
+            usb: Usb {
+                key_hex_path: key_path.display().to_string(),
+                expected_sha256: None,
+            },
+            fallback: Fallback {
+                enabled: false,
+                askpass: false,
+                askpass_path: None,
+                passphrase_salt: None,
+                passphrase_xor: None,
+                passphrase_iters: 1,
+            },
+            path: key_path.clone(),
+        }
+    }
+
+    #[test]
+    fn unlock_uses_usb_key_material() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        fs::write(
+            &key_path,
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+
+        let cfg = Arc::new(base_config(&key_path));
+        let provider = MockProvider::new("tank/secure", &["tank/secure"]);
+        let service = LockchainService::new(cfg, provider);
+
+        let report = service
+            .unlock("tank/secure", UnlockOptions::default())
+            .unwrap();
+
+        assert!(!report.already_unlocked);
+        assert_eq!(report.unlocked.len(), 1);
+    }
+
+    #[test]
+    fn unlock_bails_when_dataset_not_in_policy() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        let cfg = Arc::new(base_config(&key_path));
+        let provider = MockProvider::new("tank/secure", &["tank/secure"]);
+        let service = LockchainService::new(cfg, provider);
+
+        let err = service
+            .unlock("tank/other", UnlockOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, LockchainError::DatasetNotConfigured(_)));
+    }
+
+    #[test]
+    fn status_reports_locked_descendants() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        let cfg = Arc::new(base_config(&key_path));
+        let provider = MockProvider::new("tank/secure", &["tank/secure", "tank/secure/home"]);
+        let service = LockchainService::new(cfg, provider);
+
+        let status = service.status("tank/secure").unwrap();
+        assert!(status.root_locked);
+        assert_eq!(
+            status.locked_descendants,
+            vec!["tank/secure/home".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_keys_uses_provider_snapshot() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        let cfg = Arc::new(base_config(&key_path));
+        let provider = MockProvider::new("tank/secure", &["tank/secure"]);
+        let service = LockchainService::new(cfg, provider);
+
+        let snapshot = service.list_keys().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].dataset, "tank/secure");
+    }
+
+    #[test]
+    fn unlock_fails_on_checksum_mismatch() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        fs::write(&key_path, "00").unwrap();
+
+        let mut cfg = base_config(&key_path);
+        cfg.usb.expected_sha256 = Some("ffffffff".to_string());
+        let cfg = Arc::new(cfg);
+        let provider = MockProvider::new("tank/secure", &["tank/secure"]);
+        let service = LockchainService::new(cfg, provider);
+
+        let err = service
+            .unlock("tank/secure", UnlockOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, LockchainError::InvalidConfig(_)));
+    }
+}

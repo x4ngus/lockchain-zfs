@@ -1,3 +1,3 @@
 fn main() {
-println!("lockchain-ui: don't forget your LockChain!");
+    println!("lockchain-ui: don't forget your LockChain!");
 }

@@ -1,0 +1,64 @@
+name: CI (Ubuntu 25.10+, Rust)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build, Lint & Test (Ubuntu 25.10 container)
+    # We run inside an Ubuntu 25.10 container on a hosted runner.
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:25.10
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Install base deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config libssl-dev \
+            clang llvm libclang-dev
+          update-ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + components
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          source "$HOME/.cargo/env"
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-25.10-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-25.10-cargo-
+
+      - name: Show Rust version
+        run: |
+          rustc -V
+          cargo -V
+          rustup show
+
+      - name: Fmt (rustfmt)
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Unit tests
+        run: cargo test --locked --all -- --nocapture

@@ -1,10 +1,9 @@
 pub mod config;
 pub mod error;
+pub mod provider;
+pub mod service;
 
-use serde::{Serialize, Deserialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AppConfig {
-pub datasets: Vec<String>,
-pub usb_fingerprint: Option<String>,
-}
+pub use config::{CryptoCfg, Fallback, LockchainConfig, Policy, Usb};
+pub use error::{LockchainError, LockchainResult};
+pub use provider::{DatasetKeyDescriptor, KeyState, KeyStatusSnapshot, ZfsProvider};
+pub use service::{LockchainService, UnlockOptions, UnlockReport};
