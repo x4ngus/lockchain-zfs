@@ -1,0 +1,9 @@
+[package]
+name = "lockchain-zfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lockchain-core = { path = "../lockchain-core" }
+tokio = { version = "1", features = ["process","macros"] }
+regex = "1"

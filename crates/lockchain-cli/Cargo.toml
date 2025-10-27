@@ -1,0 +1,10 @@
+[package]
+name = "lockchain-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lockchain-core = { path = "../lockchain-core" }
+lockchain-zfs = { path = "../lockchain-zfs" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros","process"] }

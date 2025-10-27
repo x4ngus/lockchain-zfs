@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+update-initramfs -u || true
+systemctl daemon-reload || true

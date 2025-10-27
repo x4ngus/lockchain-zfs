@@ -1,0 +1,10 @@
+[Unit]
+Description=LockChain ZFS Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/lockchain-daemon
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

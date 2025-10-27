@@ -1,0 +1,12 @@
+[Unit]
+Description=LockChain ZFS Auto-Unlock
+DefaultDependencies=no
+Before=zfs-mount.service
+ConditionPathExists=/run/lockchain/token.key
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/lockchain-cli unlock
+
+[Install]
+WantedBy=sysinit.target
