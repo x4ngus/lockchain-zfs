@@ -1,12 +1,16 @@
 use crate::config::LockchainConfig;
 use crate::error::{LockchainError, LockchainResult};
+use crate::keyfile::{read_key_file, write_raw_key_file};
 use crate::provider::{KeyStatusSnapshot, ZfsProvider};
 use hex::FromHex;
+use log::warn;
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
-use std::fs;
-use std::path::PathBuf;
+use std::cmp::min;
+use std::path::Path;
 use std::sync::Arc;
+use std::thread::sleep;
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// Options that tune the unlock workflow.
@@ -46,6 +50,50 @@ impl<P: ZfsProvider> LockchainService<P> {
     }
 
     pub fn unlock(&self, dataset: &str, options: UnlockOptions) -> LockchainResult<UnlockReport> {
+        self.perform_unlock(dataset, options)
+    }
+
+    pub fn unlock_with_retry(
+        &self,
+        dataset: &str,
+        options: UnlockOptions,
+    ) -> LockchainResult<UnlockReport> {
+        let policy = &self.config.retry;
+        let mut attempt: u32 = 0;
+        let mut delay_ms = policy.base_delay_ms.max(1);
+
+        loop {
+            attempt += 1;
+            match self.perform_unlock(dataset, options.clone()) {
+                Ok(report) => return Ok(report),
+                Err(err) => {
+                    if attempt >= policy.max_attempts {
+                        return Err(LockchainError::RetryExhausted {
+                            attempts: attempt,
+                            last_error: err.to_string(),
+                        });
+                    }
+
+                    let jitter_ms = if policy.jitter_ratio > 0.0 {
+                        let pseudo = ((attempt * 37) % 100) as f64 / 100.0 - 0.5;
+                        let factor = 1.0 + (policy.jitter_ratio * pseudo);
+                        ((delay_ms as f64 * factor).max(1.0)).round() as u64
+                    } else {
+                        delay_ms
+                    };
+
+                    sleep(Duration::from_millis(jitter_ms));
+                    delay_ms = min(delay_ms.saturating_mul(2), policy.max_delay_ms.max(1));
+                }
+            }
+        }
+    }
+
+    fn perform_unlock(
+        &self,
+        dataset: &str,
+        options: UnlockOptions,
+    ) -> LockchainResult<UnlockReport> {
         if !self.config.contains_dataset(dataset) {
             return Err(LockchainError::DatasetNotConfigured(dataset.to_string()));
         }
@@ -113,28 +161,23 @@ impl<P: ZfsProvider> LockchainService<P> {
         }
 
         let usb_key_path = self.config.key_hex_path();
-        match fs::read_to_string(&usb_key_path) {
-            Ok(contents) => {
-                let key = self.decode_hex_key(&usb_key_path, &contents)?;
+        match self.load_usb_key(&usb_key_path) {
+            Ok(key) => {
                 self.verify_checksum(&key)?;
-                return Ok(Zeroizing::new(key));
+                return Ok(key);
             }
-            Err(read_err) => {
-                if options.strict_usb {
-                    return Err(match read_err.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            LockchainError::MissingKeySource(dataset.to_string())
-                        }
-                        _ => LockchainError::Io(read_err),
-                    });
-                }
+            Err(err) => {
+                let io_error = matches!(&err, LockchainError::Io(_));
+                let missing = matches!(
+                    &err,
+                    LockchainError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound
+                );
 
-                if !self.config.fallback.enabled {
-                    return Err(match read_err.kind() {
-                        std::io::ErrorKind::NotFound => {
-                            LockchainError::MissingKeySource(dataset.to_string())
-                        }
-                        _ => LockchainError::Io(read_err),
+                if !io_error || options.strict_usb || !self.config.fallback.enabled {
+                    return Err(if missing {
+                        LockchainError::MissingKeySource(dataset.to_string())
+                    } else {
+                        err
                     });
                 }
             }
@@ -150,19 +193,12 @@ impl<P: ZfsProvider> LockchainService<P> {
         Ok(key)
     }
 
-    fn decode_hex_key(&self, path: &PathBuf, contents: &str) -> LockchainResult<Vec<u8>> {
-        let filtered: String = contents.split_whitespace().collect::<Vec<_>>().join("");
-        if filtered.is_empty() {
-            return Err(LockchainError::InvalidHexKey {
-                path: path.clone(),
-                reason: "file is empty".to_string(),
-            });
+    fn load_usb_key(&self, path: &Path) -> LockchainResult<Zeroizing<Vec<u8>>> {
+        let (key, converted) = read_key_file(path)?;
+        if converted {
+            write_raw_key_file(path, &key)?;
         }
-
-        Vec::from_hex(&filtered).map_err(|err| LockchainError::InvalidHexKey {
-            path: path.clone(),
-            reason: err.to_string(),
-        })
+        Ok(key)
     }
 
     fn verify_checksum(&self, key: &[u8]) -> LockchainResult<()> {
@@ -175,11 +211,13 @@ impl<P: ZfsProvider> LockchainService<P> {
                     expected, actual
                 )));
             }
+        } else {
+            warn!("usb.expected_sha256 not configured; skipping checksum verification");
         }
         Ok(())
     }
 
-    fn derive_fallback_key(&self, passphrase: &[u8]) -> LockchainResult<Zeroizing<Vec<u8>>> {
+    pub fn derive_fallback_key(&self, passphrase: &[u8]) -> LockchainResult<Zeroizing<Vec<u8>>> {
         let fallback = &self.config.fallback;
         let salt_hex = fallback.passphrase_salt.as_ref().ok_or_else(|| {
             LockchainError::InvalidConfig("fallback.passphrase_salt missing".into())
@@ -219,9 +257,12 @@ impl<P: ZfsProvider> LockchainService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CryptoCfg, Fallback, LockchainConfig, Policy, Usb};
+    use crate::config::{CryptoCfg, Fallback, LockchainConfig, Policy, RetryCfg, Usb};
     use crate::provider::{DatasetKeyDescriptor, KeyState, KeyStatusSnapshot, ZfsProvider};
     use std::collections::HashSet;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -229,6 +270,7 @@ mod tests {
         root: String,
         locked: Mutex<HashSet<String>>,
         observed_keys: Mutex<Vec<Vec<u8>>>,
+        failures_before_success: Mutex<u32>,
     }
 
     impl MockProvider {
@@ -237,6 +279,16 @@ mod tests {
                 root: root.to_string(),
                 locked: Mutex::new(locked.iter().map(|s| s.to_string()).collect()),
                 observed_keys: Mutex::new(Vec::new()),
+                failures_before_success: Mutex::new(0),
+            }
+        }
+
+        fn with_failures(root: &str, locked: &[&str], failures: u32) -> Self {
+            Self {
+                root: root.to_string(),
+                locked: Mutex::new(locked.iter().map(|s| s.to_string()).collect()),
+                observed_keys: Mutex::new(Vec::new()),
+                failures_before_success: Mutex::new(failures),
             }
         }
     }
@@ -253,6 +305,11 @@ mod tests {
         }
 
         fn load_key_tree(&self, _root: &str, key: &[u8]) -> LockchainResult<Vec<String>> {
+            let mut failures = self.failures_before_success.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(LockchainError::Provider("simulated failure".into()));
+            }
             self.observed_keys.lock().unwrap().push(key.to_vec());
             let mut guard = self.locked.lock().unwrap();
             let mut unlocked: Vec<String> = guard.iter().cloned().collect();
@@ -283,6 +340,7 @@ mod tests {
             policy: Policy {
                 datasets: vec!["tank/secure".to_string()],
                 zfs_path: None,
+                zpool_path: None,
                 binary_path: None,
                 allow_root: false,
             },
@@ -290,6 +348,7 @@ mod tests {
             usb: Usb {
                 key_hex_path: key_path.display().to_string(),
                 expected_sha256: None,
+                ..Usb::default()
             },
             fallback: Fallback {
                 enabled: false,
@@ -299,6 +358,7 @@ mod tests {
                 passphrase_xor: None,
                 passphrase_iters: 1,
             },
+            retry: RetryCfg::default(),
             path: key_path.clone(),
         }
     }
@@ -323,6 +383,10 @@ mod tests {
 
         assert!(!report.already_unlocked);
         assert_eq!(report.unlocked.len(), 1);
+
+        let metadata = fs::metadata(&key_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+        assert_eq!(fs::read(&key_path).unwrap().len(), 32);
     }
 
     #[test]
@@ -373,7 +437,11 @@ mod tests {
     fn unlock_fails_on_checksum_mismatch() {
         let dir = tempdir().unwrap();
         let key_path = dir.path().join("key.hex");
-        fs::write(&key_path, "00").unwrap();
+        fs::write(
+            &key_path,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
 
         let mut cfg = base_config(&key_path);
         cfg.usb.expected_sha256 = Some("ffffffff".to_string());
@@ -386,5 +454,71 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, LockchainError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn unlock_fails_on_invalid_usb_key_material() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        fs::write(&key_path, "00").unwrap();
+
+        let cfg = Arc::new(base_config(&key_path));
+        let provider = MockProvider::new("tank/secure", &["tank/secure"]);
+        let service = LockchainService::new(cfg, provider);
+
+        let err = service
+            .unlock("tank/secure", UnlockOptions::default())
+            .unwrap_err();
+
+        assert!(matches!(err, LockchainError::InvalidHexKey { .. }));
+    }
+
+    #[test]
+    fn unlock_with_retry_succeeds_after_transient_failures() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        fs::write(
+            &key_path,
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+
+        let cfg = Arc::new(base_config(&key_path));
+        let provider = MockProvider::with_failures("tank/secure", &["tank/secure"], 2);
+        let service = LockchainService::new(cfg, provider);
+
+        let report = service
+            .unlock_with_retry("tank/secure", UnlockOptions::default())
+            .unwrap();
+        assert!(!report.already_unlocked);
+    }
+
+    #[test]
+    fn unlock_with_retry_reports_exhaustion() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("key.hex");
+        fs::write(
+            &key_path,
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap();
+
+        let mut cfg = base_config(&key_path);
+        cfg.retry.max_attempts = 2;
+        cfg.retry.base_delay_ms = 1;
+        cfg.retry.max_delay_ms = 2;
+        let cfg = Arc::new(cfg);
+
+        let provider = MockProvider::with_failures("tank/secure", &["tank/secure"], 5);
+        let service = LockchainService::new(cfg, provider);
+
+        let err = service
+            .unlock_with_retry("tank/secure", UnlockOptions::default())
+            .unwrap_err();
+
+        match err {
+            LockchainError::RetryExhausted { attempts, .. } => assert_eq!(attempts, 2),
+            other => panic!("unexpected error {other:?}"),
+        }
     }
 }

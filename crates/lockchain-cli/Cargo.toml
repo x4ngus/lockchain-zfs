@@ -1,6 +1,6 @@
 [package]
 name = "lockchain-cli"
-version = "0.1.0"
+version = "0.1.9"
 edition = "2021"
 
 [dependencies]
@@ -9,3 +9,8 @@ lockchain-zfs = { path = "../lockchain-zfs" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 rpassword = "7"
+crossterm = "0.27"
+ratatui = "0.26"
+schemars = "0.8"
+serde_json = "1"
+log = "0.4"

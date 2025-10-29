@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <style>
+      .bg{fill:#0D0D13}
+      .chain{fill:none; stroke:#FF2BD1; stroke-width:44; stroke-linecap:round; stroke-linejoin:round}
+      .inner{fill:#111217; stroke:#00E5FF; stroke-width:28; stroke-linecap:round; stroke-linejoin:round}
+      .shackle{fill:none; stroke:#00E5FF; stroke-width:40; stroke-linecap:round}
+      .circuit{fill:none; stroke:#00E5FF; stroke-width:18; stroke-linecap:round; stroke-linejoin:round}
+      .node{fill:#00E5FF}
+      .keyhole{fill:#FF2BD1}
+    </style>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="96" class="bg"/>
+  <path class="chain" d="M256 448 L120 336 L120 208 L256 128 L392 208 L392 336 Z"/>
+  <path class="chain" d="M172 190 L224 230"/>
+  <path class="chain" d="M340 190 L288 230"/>
+  <path class="inner" d="M256 394 L176 330 L176 240 L256 194 L336 240 L336 330 Z"/>
+  <path class="shackle" d="M206 226 A 74 74 0 0 1 306 226"/>
+  <path class="circuit" d="M256 354 L256 310 M256 310 L218 280 M256 310 L294 288"/>
+  <circle class="node" cx="218" cy="280" r="10"/>
+  <circle class="node" cx="294" cy="288" r="10"/>
+  <g transform="translate(256,268)">
+    <circle class="keyhole" r="18"/>
+    <rect class="keyhole" x="-10" y="16" width="20" height="34" rx="8"/>
+  </g>
+</svg>

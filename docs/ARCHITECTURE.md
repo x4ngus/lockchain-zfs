@@ -1,7 +1,8 @@
 # Architecture Overview
 
 This document outlines the service boundaries inside the LockChain workspace,
-with a focus on the ZFS provider contract shared across the crates.
+with a focus on the ZFS provider contract shared across the crates and the way
+long-running services compose with the USB watcher.
 
 ## Core Concepts
 
@@ -55,12 +56,31 @@ pub trait ZfsProvider {
 
 ## Implementations
 
-| Implementation | Crate            | Notes                                                     |
-|----------------|------------------|-----------------------------------------------------------|
-| `SystemZfsProvider` | `lockchain-zfs` | Shells out to the native `zfs` CLI with timeout controls. |
-| `MockProvider`      | `lockchain-core` tests | In-memory implementation validating service behaviour. |
+| Implementation | Crate | Notes |
+| --- | --- | --- |
+| `SystemZfsProvider` | `lockchain-zfs` | Shells out to the native `zfs`/`zpool` CLI with timeout controls and exit-code mapping. |
+| `MockProvider` | `lockchain-core` tests | In-memory implementation validating service behaviour. |
+| `DaemonService` | `lockchain-daemon` | Long-running process orchestrating USB events, scheduled unlocks, and health reporting. |
 
 When adding new providers, ensure they satisfy the contract above and write
 integration or unit tests that demonstrate compliance. The unit tests in
 `lockchain-core` serve as a compatibility suite; they will fail early if the
 contract is broken.
+
+## Services Model
+
+LockChain now ships with two continuously running components:
+
+- **lockchain-key-usb** — a udev-backed watcher that normalises vault sticks,
+  rewrites legacy hex keys to raw bytes and mirrors them into `/run/lockchain/`
+  with strict permissions. It can run standalone or alongside the daemon.
+- **lockchain-daemon** — a Tokio service that loads configuration, creates a
+  `LockchainService<SystemZfsProvider>`, and performs scheduled unlock attempts
+  for the target datasets. It exposes a minimal HTTP health endpoint (default
+  `127.0.0.1:8787`) returning `OK` / `DEGRADED`, ready for consumption by systemd
+  health checks or external monitors.
+
+The daemon will eventually subscribe directly to USB events from
+`lockchain-key-usb` via shared crates; today it broadcasts health by marking the
+state ready once a watcher is active and successful unlocks occur. This design
+keeps the core logic reusable while enabling future RPC or REST entry points.

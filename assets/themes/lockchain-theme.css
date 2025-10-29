@@ -1,0 +1,12 @@
+:root {
+  --lc-bg: #0D0D13;
+  --lc-fg: #E6F8FF;
+  --lc-fg-muted: #C3D7DD;
+  --lc-cyan: #00E5FF;
+  --lc-magenta: #FF2BD1;
+  --lc-focus: #00E5FF;
+  --lc-danger: #FF2BD1;
+}
+.lc-btn { color: var(--lc-bg); background: linear-gradient(90deg, var(--lc-cyan), var(--lc-magenta)); border: 0; padding: .6rem 1rem; border-radius: .6rem; }
+.lc-card { background: #111218; color: var(--lc-fg); border: 1px solid #1e1f27; border-radius: 1rem;
+           box-shadow: 0 0 0 1px rgba(255,255,255,0.02), 0 10px 30px rgba(0,0,0,.35); }

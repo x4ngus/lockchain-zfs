@@ -1,15 +1,23 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use lockchain_core::{
     config::Policy,
+    keyfile::write_raw_key_file,
+    logging,
     provider::{DatasetKeyDescriptor, KeyState},
     LockchainConfig, LockchainService, UnlockOptions,
 };
 use lockchain_zfs::SystemZfsProvider;
+use log::warn;
 use rpassword::prompt_password;
+use schemars::schema_for;
+use serde_json::to_string_pretty;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+mod tui;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -58,6 +66,38 @@ enum Commands {
 
     /// List the managed datasets and their current key status.
     ListKeys,
+
+    /// Launch the interactive TUI unlocker.
+    Tui,
+
+    /// Validate a configuration file or emit the config schema.
+    Validate {
+        /// Path to the configuration file to validate.
+        #[arg(short = 'f', long, default_value = "/etc/lockchain-zfs.toml")]
+        file: PathBuf,
+
+        /// Output the JSON schema instead of validating a file.
+        #[arg(long)]
+        schema: bool,
+    },
+
+    /// Derive the fallback key and write it to disk (emergency only).
+    Breakglass {
+        /// Dataset to target; defaults to the first entry in policy.datasets.
+        dataset: Option<String>,
+
+        /// File path to write the derived key material to.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Provide the emergency passphrase directly.
+        #[arg(long)]
+        passphrase: Option<String>,
+
+        /// Skip interactive confirmations.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -68,16 +108,106 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    logging::init("info");
     let cli = Cli::parse();
-
-    let config =
-        Arc::new(LockchainConfig::load(&cli.config).with_context(|| {
-            format!("failed to load configuration from {}", cli.config.display())
-        })?);
-    let provider = SystemZfsProvider::from_config(&config)?;
-    let service = LockchainService::new(config.clone(), provider);
+    let config_path = cli.config.clone();
 
     match cli.command {
+        Commands::Validate { file, schema } => {
+            if schema {
+                let schema = schema_for!(LockchainConfig);
+                println!("{}", to_string_pretty(&schema)?);
+                return Ok(());
+            }
+
+            let cfg = LockchainConfig::load(&file)
+                .with_context(|| format!("failed to load configuration from {}", file.display()))?;
+
+            let issues = cfg.validate();
+            if issues.is_empty() {
+                println!(
+                    "Configuration valid ({} datasets).",
+                    cfg.policy.datasets.len()
+                );
+            } else {
+                eprintln!("Configuration validation failed:");
+                for issue in issues {
+                    eprintln!("  - {issue}");
+                }
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Commands::Breakglass {
+            dataset,
+            output,
+            passphrase,
+            force,
+        } => {
+            let config = Arc::new(LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?);
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let service = LockchainService::new(config.clone(), provider);
+
+            let target = resolve_dataset(dataset, &config.policy)?;
+            if !config.fallback.enabled {
+                bail!("fallback recovery is not enabled in this configuration");
+            }
+            if config.fallback.passphrase_salt.is_none() || config.fallback.passphrase_xor.is_none()
+            {
+                bail!("fallback configuration is incomplete (salt/xor missing)");
+            }
+
+            if !force {
+                println!("*** BREAK-GLASS RECOVERY ***");
+                println!(
+                    "This will derive the raw key for dataset `{}` and write it to {}.",
+                    target,
+                    output.display()
+                );
+                println!("Type the dataset name to continue or press Enter to abort:");
+                print!("> ");
+                io::stdout().flush().ok();
+                let mut confirm_dataset = String::new();
+                io::stdin().read_line(&mut confirm_dataset)?;
+                if confirm_dataset.trim() != target {
+                    println!("Break-glass aborted.");
+                    return Ok(());
+                }
+
+                println!("Type BREAKGLASS to confirm this emergency action:");
+                print!("> ");
+                io::stdout().flush().ok();
+                let mut confirm_phrase = String::new();
+                io::stdin().read_line(&mut confirm_phrase)?;
+                if confirm_phrase.trim() != "BREAKGLASS" {
+                    println!("Break-glass aborted.");
+                    return Ok(());
+                }
+            }
+
+            let passphrase = match passphrase {
+                Some(p) => p,
+                None => prompt_password(format!("Emergency passphrase for {target}: "))?,
+            };
+
+            let key = service.derive_fallback_key(passphrase.as_bytes())?;
+            write_raw_key_file(&output, &key)?;
+
+            warn!(
+                "[LC4000] break-glass recovery invoked for dataset {target}, output {}",
+                output.display()
+            );
+            println!(
+                "Emergency key material written to {} (permissions set to 0400). Remember to securely delete this file when finished.",
+                output.display()
+            );
+            return Ok(());
+        }
         Commands::Unlock {
             dataset,
             strict_usb,
@@ -85,6 +215,14 @@ fn run() -> Result<()> {
             prompt_passphrase,
             key_file,
         } => {
+            let config = Arc::new(LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?);
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let service = LockchainService::new(config.clone(), provider);
             let target = resolve_dataset(dataset, &config.policy)?;
             let mut options = UnlockOptions::default();
             options.strict_usb = strict_usb;
@@ -109,7 +247,7 @@ fn run() -> Result<()> {
                 options.fallback_passphrase = Some(value);
             }
 
-            let report = service.unlock(&target, options)?;
+            let report = service.unlock_with_retry(&target, options)?;
             if report.already_unlocked {
                 println!(
                     "Dataset {} (root {}) already has an available key.",
@@ -126,6 +264,14 @@ fn run() -> Result<()> {
             }
         }
         Commands::Status { dataset } => {
+            let config = Arc::new(LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?);
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let service = LockchainService::new(config.clone(), provider);
             let datasets = match dataset {
                 Some(ds) => vec![ds],
                 None => config.policy.datasets.clone(),
@@ -155,8 +301,27 @@ fn run() -> Result<()> {
             }
         }
         Commands::ListKeys => {
+            let config = Arc::new(LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?);
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let service = LockchainService::new(config.clone(), provider);
             let snapshot = service.list_keys()?;
             print_key_table(snapshot);
+        }
+        Commands::Tui => {
+            let config = Arc::new(LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?);
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let service = LockchainService::new(config.clone(), provider);
+            tui::launch(config, service)?;
         }
     }
 

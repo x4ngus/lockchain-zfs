@@ -1,5 +1,7 @@
 pub mod config;
 pub mod error;
+pub mod keyfile;
+pub mod logging;
 pub mod provider;
 pub mod service;
 
