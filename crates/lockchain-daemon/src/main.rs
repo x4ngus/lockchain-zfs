@@ -1,3 +1,5 @@
+//! Background daemon that watches the USB token and keeps datasets unlocked.
+
 use anyhow::{Context, Result};
 use lockchain_core::{
     config::LockchainConfig,
@@ -7,7 +9,7 @@ use lockchain_core::{
 use lockchain_zfs::SystemZfsProvider;
 use log::{error, info, warn};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::{
     net::TcpListener,
@@ -18,6 +20,61 @@ use tokio::{
 
 mod usb;
 
+/// Tracks whether USB discovery and unlock routines consider the world healthy.
+#[derive(Default)]
+struct HealthState {
+    usb_ready: bool,
+    unlock_ready: bool,
+}
+
+/// Shared handle used to notify other tasks when overall health changes.
+#[derive(Clone)]
+struct HealthChannel {
+    inner: Arc<HealthInner>,
+}
+
+struct HealthInner {
+    state: Mutex<HealthState>,
+    tx: watch::Sender<bool>,
+}
+
+impl HealthChannel {
+    /// Create a new channel bound to the provided watch sender.
+    fn new(tx: watch::Sender<bool>) -> Self {
+        Self {
+            inner: Arc::new(HealthInner {
+                state: Mutex::new(HealthState::default()),
+                tx,
+            }),
+        }
+    }
+
+    /// Record the latest USB availability status.
+    fn set_usb_ready(&self, ready: bool) {
+        let mut state = self.inner.state.lock().unwrap();
+        let changed = state.usb_ready != ready;
+        state.usb_ready = ready;
+        let healthy = state.usb_ready && state.unlock_ready;
+        drop(state);
+        if changed {
+            let _ = self.inner.tx.send(healthy);
+        }
+    }
+
+    /// Record whether unlock attempts have been succeeding lately.
+    fn set_unlock_ready(&self, ready: bool) {
+        let mut state = self.inner.state.lock().unwrap();
+        let changed = state.unlock_ready != ready;
+        state.unlock_ready = ready;
+        let healthy = state.usb_ready && state.unlock_ready;
+        drop(state);
+        if changed {
+            let _ = self.inner.tx.send(healthy);
+        }
+    }
+}
+
+/// Entry point for the Tokio runtime; logs failures before exit.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(err) = run().await {
@@ -26,6 +83,7 @@ async fn main() {
     }
 }
 
+/// Load configuration, start background tasks, and juggle shutdown signals.
 async fn run() -> Result<()> {
     logging::init("info");
     let config_path =
@@ -42,12 +100,13 @@ async fn run() -> Result<()> {
 
     // health status broadcast (true = ready, false = degraded)
     let (health_tx, health_rx) = watch::channel(false);
+    let health_channel = HealthChannel::new(health_tx.clone());
 
-    let usb_handle = tokio::spawn(usb::watch_usb(config.clone(), health_tx.clone()));
+    let usb_handle = tokio::spawn(usb::watch_usb(config.clone(), health_channel.clone()));
     let unlock_handle = tokio::spawn(periodic_unlock(
         service.clone(),
         config.clone(),
-        health_tx.clone(),
+        health_channel.clone(),
     ));
     let health_handle = tokio::spawn(health_server(health_rx));
 
@@ -63,10 +122,11 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Periodically attempt to unlock the configured dataset and update health.
 async fn periodic_unlock(
     service: Arc<LockchainService<SystemZfsProvider>>,
     config: Arc<LockchainConfig>,
-    health_tx: watch::Sender<bool>,
+    health: HealthChannel,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(30));
     let mut last_success = Instant::now();
@@ -78,6 +138,15 @@ async fn periodic_unlock(
             continue;
         }
 
+        let key_path = config.key_hex_path();
+        let key_ready = std::fs::metadata(&key_path)
+            .map(|meta| meta.is_file() && meta.len() == 32)
+            .unwrap_or(false);
+        if !key_ready {
+            health.set_unlock_ready(false);
+            continue;
+        }
+
         match service.unlock_with_retry(&dataset, UnlockOptions::default()) {
             Ok(report) => {
                 if report.already_unlocked {
@@ -85,12 +154,12 @@ async fn periodic_unlock(
                 } else {
                     info!("unlocked {dataset} with {} nodes", report.unlocked.len());
                 }
-                let _ = health_tx.send(true);
+                health.set_unlock_ready(true);
                 last_success = Instant::now();
             }
             Err(err) => {
                 warn!("unlock attempt failed for {dataset}: {err}");
-                let _ = health_tx.send(false);
+                health.set_unlock_ready(false);
                 // degrade if failure lasts >5 minutes
                 if last_success.elapsed() > Duration::from_secs(300) {
                     warn!(
@@ -103,6 +172,7 @@ async fn periodic_unlock(
     }
 }
 
+/// Expose a bare-bones HTTP endpoint for readiness checks.
 async fn health_server(status_rx: watch::Receiver<bool>) -> Result<()> {
     let addr: SocketAddr = std::env::var("LOCKCHAIN_HEALTH_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8787".to_string())

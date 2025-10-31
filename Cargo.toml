@@ -7,6 +7,7 @@ members = [
     "crates/lockchain-daemon",
     "crates/lockchain-cli",
     "crates/lockchain-ui",
+    "packaging/lockchain-deb",
 ]
 
 [workspace.package]

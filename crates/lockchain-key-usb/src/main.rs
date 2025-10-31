@@ -1,3 +1,5 @@
+//! USB watcher that copies key material from removable media into place.
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hex::encode as hex_encode;
@@ -19,6 +21,7 @@ use udev::{Device, Enumerator, MonitorBuilder};
 const DEFAULT_CONFIG_PATH: &str = "/etc/lockchain-zfs.toml";
 const MOUNTS_OVERRIDE_ENV: &str = "LOCKCHAIN_KEY_USB_MOUNTS_PATH";
 
+/// Command-line options for the USB watcher service.
 #[derive(Parser, Debug)]
 #[command(
     name = "lockchain-key-usb",
@@ -31,6 +34,7 @@ struct Args {
     config: PathBuf,
 }
 
+/// Top-level entry: wrap run() and map errors to logs + exit codes.
 fn main() {
     if let Err(err) = run() {
         error!("{err:?}");
@@ -38,6 +42,7 @@ fn main() {
     }
 }
 
+/// Load configuration, prime the daemon, and start monitoring udev events.
 fn run() -> Result<()> {
     logging::init("info");
 
@@ -57,6 +62,7 @@ fn run() -> Result<()> {
     daemon.event_loop()
 }
 
+/// Tracks the currently mounted USB device so we can clean up on removal.
 #[derive(Debug)]
 struct ActiveDevice {
     devpath: String,
@@ -67,12 +73,14 @@ struct ActiveDevice {
     source_path: PathBuf,
 }
 
+/// Handles device discovery, checksum verification, and file synchronisation.
 struct UsbKeyDaemon {
     config: Arc<LockchainConfig>,
     active: Mutex<Option<ActiveDevice>>,
 }
 
 impl UsbKeyDaemon {
+    /// Construct a daemon with shared configuration.
     fn new(config: Arc<LockchainConfig>) -> Self {
         Self {
             config,
@@ -80,6 +88,7 @@ impl UsbKeyDaemon {
         }
     }
 
+    /// Look for already-mounted USB devices that match policy.
     fn scan_existing(&self) -> Result<()> {
         let mut enumerator = Enumerator::new()?;
         enumerator.match_subsystem("block")?;
@@ -92,6 +101,7 @@ impl UsbKeyDaemon {
         Ok(())
     }
 
+    /// Block on udev events and react to arrivals and removals.
     fn event_loop(&self) -> Result<()> {
         let mut monitor = MonitorBuilder::new()?.match_subsystem("block")?.listen()?;
 
@@ -110,6 +120,7 @@ impl UsbKeyDaemon {
         }
     }
 
+    /// Dispatch the udev event to either import or cleanup handlers.
     fn process_device(&self, device: &Device) -> Result<()> {
         let action = device.action().and_then(os_str_to_str).unwrap_or("change");
         match action {
@@ -122,6 +133,7 @@ impl UsbKeyDaemon {
         }
     }
 
+    /// Validate the device, verify content, and copy key material into place.
     fn try_import(&self, device: &Device) -> Result<()> {
         if !self.device_matches(device) {
             return Ok(());
@@ -198,6 +210,7 @@ impl UsbKeyDaemon {
         Ok(())
     }
 
+    /// Tear down state when the matching USB device disappears.
     fn handle_removal(&self, device: &Device) {
         let mut guard = self.active.lock().unwrap();
         if guard.is_none() {
@@ -228,6 +241,7 @@ impl UsbKeyDaemon {
         }
     }
 
+    /// Remove the destination key to avoid stale material lingering.
     fn clear_destination(&self) {
         let dest = self.config.key_hex_path();
         match fs::remove_file(&dest) {
@@ -237,6 +251,7 @@ impl UsbKeyDaemon {
         }
     }
 
+    /// Poll /proc/mounts until the device shows up or we time out.
     fn wait_for_mount(&self, devnode: &Path) -> Result<PathBuf> {
         let timeout = Duration::from_secs(self.config.usb.mount_timeout_secs);
         let deadline = Instant::now() + timeout;
@@ -256,6 +271,7 @@ impl UsbKeyDaemon {
         }
     }
 
+    /// Check whether the udev device aligns with our configured label/UUID.
     fn device_matches(&self, device: &Device) -> bool {
         if device.property_value("DEVTYPE").and_then(os_str_to_str) != Some("partition") {
             return false;
@@ -283,20 +299,24 @@ impl UsbKeyDaemon {
     }
 }
 
+/// Provide a human-readable path for logging udev devices.
 fn device_syspath(device: &Device) -> String {
     device.syspath().to_string_lossy().into_owned()
 }
 
+/// Convenience helper for zero-copy OsStr → &str conversions.
 fn os_str_to_str(value: &OsStr) -> Option<&str> {
     value.to_str()
 }
 
+/// Locate the mountpoint for a block device by scanning the mount table.
 fn find_mount_point(devnode: &Path) -> Result<Option<PathBuf>> {
     let mounts = read_mount_table()?;
     let devnode_str = devnode.to_string_lossy();
     Ok(parse_mounts(&mounts, devnode_str.as_ref()))
 }
 
+/// Read `/proc/mounts` or its override for testing purposes.
 fn read_mount_table() -> Result<String> {
     if let Ok(path) = env::var(MOUNTS_OVERRIDE_ENV) {
         return Ok(fs::read_to_string(&path).with_context(|| format!("read mounts file {path}"))?);
@@ -304,6 +324,7 @@ fn read_mount_table() -> Result<String> {
     Ok(fs::read_to_string("/proc/mounts").context("read /proc/mounts")?)
 }
 
+/// Parse the mount table content and return a matching mountpoint path.
 fn parse_mounts(mounts: &str, devnode: &str) -> Option<PathBuf> {
     for line in mounts.lines() {
         if line.trim().is_empty() {
@@ -325,6 +346,7 @@ fn parse_mounts(mounts: &str, devnode: &str) -> Option<PathBuf> {
     None
 }
 
+/// Convert fstab-style escaped fields back into display strings.
 fn unescape_mount_field(input: &str) -> String {
     let mut chars = input.chars().peekable();
     let mut output = String::with_capacity(input.len());

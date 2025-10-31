@@ -1,3 +1,7 @@
+//! System-backed `ZfsProvider` implementation. It shells out to the platform
+//! binaries, checks the health of pools, and tracks which datasets still need
+//! their encryption keys loaded.
+
 use crate::command::{CommandRunner, Output};
 use crate::parse::{parse_tabular_pairs, pool_from_dataset};
 use lockchain_core::config::LockchainConfig;
@@ -7,6 +11,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Default locations we probe when looking for a `zfs` binary on the host.
 pub const DEFAULT_ZFS_PATHS: &[&str] = &[
     "/sbin/zfs",
     "/usr/sbin/zfs",
@@ -14,6 +19,7 @@ pub const DEFAULT_ZFS_PATHS: &[&str] = &[
     "/bin/zfs",
 ];
 
+/// Default locations we probe when looking for a `zpool` binary on the host.
 pub const DEFAULT_ZPOOL_PATHS: &[&str] = &[
     "/sbin/zpool",
     "/usr/sbin/zpool",
@@ -21,13 +27,15 @@ pub const DEFAULT_ZPOOL_PATHS: &[&str] = &[
     "/bin/zpool",
 ];
 
-/// Concrete `ZfsProvider` that shells out to the native `zfs` CLI.
+/// System-oriented `ZfsProvider` that shells out to the native `zfs` and `zpool` CLIs.
+#[derive(Clone)]
 pub struct SystemZfsProvider {
     zfs_runner: CommandRunner,
     zpool_runner: CommandRunner,
 }
 
 impl SystemZfsProvider {
+    /// Build a provider from the user configuration, falling back to discovery when needed.
     pub fn from_config(config: &LockchainConfig) -> LockchainResult<Self> {
         let timeout = config.zfs_timeout();
         let zfs_runner = if let Some(path) = config.zfs_binary_path() {
@@ -48,6 +56,7 @@ impl SystemZfsProvider {
         })
     }
 
+    /// Construct a provider with an explicit `zfs` path and an auto-discovered `zpool`.
     pub fn with_path(path: PathBuf, timeout: Duration) -> LockchainResult<Self> {
         let zfs_runner = Self::runner_with_path(path, timeout)?;
         let zpool_runner = Self::discover_zpool(timeout)?;
@@ -57,6 +66,7 @@ impl SystemZfsProvider {
         })
     }
 
+    /// Construct a provider with explicit `zfs` and `zpool` binaries.
     pub fn with_paths(
         zfs_path: PathBuf,
         zpool_path: PathBuf,
@@ -70,6 +80,7 @@ impl SystemZfsProvider {
         })
     }
 
+    /// Validate that the given path exists and wrap it in a `CommandRunner`.
     fn runner_with_path(path: PathBuf, timeout: Duration) -> LockchainResult<CommandRunner> {
         if !path.exists() {
             return Err(LockchainError::InvalidConfig(format!(
@@ -80,6 +91,7 @@ impl SystemZfsProvider {
         Ok(CommandRunner::new(path, timeout))
     }
 
+    /// Auto-discover both binaries using the built-in search paths.
     pub fn discover(timeout: Duration) -> LockchainResult<Self> {
         let zfs_runner = Self::discover_zfs(timeout)?;
         let zpool_runner = Self::discover_zpool(timeout)?;
@@ -89,6 +101,7 @@ impl SystemZfsProvider {
         })
     }
 
+    /// Walk through `DEFAULT_ZFS_PATHS` until a workable binary is found.
     fn discover_zfs(timeout: Duration) -> LockchainResult<CommandRunner> {
         for candidate in DEFAULT_ZFS_PATHS {
             let p = Path::new(candidate);
@@ -102,6 +115,7 @@ impl SystemZfsProvider {
         )))
     }
 
+    /// Walk through `DEFAULT_ZPOOL_PATHS` until a workable binary is found.
     fn discover_zpool(timeout: Duration) -> LockchainResult<CommandRunner> {
         for candidate in DEFAULT_ZPOOL_PATHS {
             let p = Path::new(candidate);
@@ -115,10 +129,12 @@ impl SystemZfsProvider {
         )))
     }
 
+    /// Run `zfs` with arguments and optional stdin payload.
     fn run_zfs(&self, args: &[&str], input: Option<&[u8]>) -> LockchainResult<Output> {
         self.zfs_runner.run(args, input)
     }
 
+    /// Run `zfs` and turn non-zero exits into descriptive provider errors.
     fn run_checked_zfs(&self, args: &[&str]) -> LockchainResult<Output> {
         let out = self.run_zfs(args, None)?;
         if out.status != 0 {
@@ -131,10 +147,12 @@ impl SystemZfsProvider {
         Ok(out)
     }
 
+    /// Run `zpool` with arguments.
     fn run_zpool(&self, args: &[&str]) -> LockchainResult<Output> {
         self.zpool_runner.run(args, None)
     }
 
+    /// Run `zpool` and surface friendlier errors on failure.
     fn run_checked_zpool(&self, args: &[&str]) -> LockchainResult<Output> {
         let out = self.run_zpool(args)?;
         if out.status != 0 {
@@ -147,6 +165,7 @@ impl SystemZfsProvider {
         Ok(out)
     }
 
+    /// Map CLI output into the right `LockchainError` bucket with context.
     fn classify_cli_error(binary: &Path, args: &[&str], output: &Output) -> LockchainError {
         let stderr = output.stderr.trim();
         let stdout = output.stdout.trim();
@@ -188,6 +207,7 @@ impl SystemZfsProvider {
         ))
     }
 
+    /// Confirm the pool exists and reports a healthy status.
     fn ensure_pool_ready(&self, pool: &str) -> LockchainResult<()> {
         let args = ["list", "-H", "-o", "name,health", pool];
         let out = self.run_checked_zpool(&args)?;
@@ -215,6 +235,7 @@ impl SystemZfsProvider {
         Ok(())
     }
 
+    /// Ensure we can resolve the dataset's pool and that the pool is healthy.
     fn ensure_dataset_pool_ready(&self, dataset: &str) -> LockchainResult<()> {
         let pool = pool_from_dataset(dataset).ok_or_else(|| {
             LockchainError::InvalidConfig(format!(
@@ -225,11 +246,13 @@ impl SystemZfsProvider {
         self.ensure_pool_ready(pool)
     }
 
+    /// Fetch a single `zfs get` property value.
     fn get_property(&self, dataset: &str, property: &str) -> LockchainResult<String> {
         let out = self.run_checked_zfs(&["get", "-H", "-o", "value", property, dataset])?;
         Ok(out.stdout.trim().to_string())
     }
 
+    /// Try to load the dataset key, ignoring the benign "already loaded" warning.
     fn load_key(&self, dataset: &str, key: &[u8]) -> LockchainResult<()> {
         let args = ["load-key", "-L", "prompt", dataset];
         let out = self.run_zfs(&args, Some(key))?;
@@ -251,11 +274,15 @@ impl SystemZfsProvider {
         Ok(())
     }
 
+    /// Ask `zfs` for the dataset's `keystatus` and translate it to `KeyState`.
+    ///
+    /// `parse_keystatus` stays separate so tests can validate the string mapping in isolation.
     fn keystatus(&self, dataset: &str) -> LockchainResult<KeyState> {
         let out = self.run_checked_zfs(&["get", "-H", "-o", "value", "keystatus", dataset])?;
         Ok(Self::parse_keystatus(out.stdout.trim()))
     }
 
+    /// Translate the raw `keystatus` field into Lockchain's enum.
     fn parse_keystatus(value: &str) -> KeyState {
         match value {
             "available" => KeyState::Available,
@@ -269,10 +296,12 @@ impl SystemZfsProvider {
 }
 
 impl ZfsProvider for SystemZfsProvider {
+    /// Ask `zfs` for the dataset's `encryptionroot` property.
     fn encryption_root(&self, dataset: &str) -> LockchainResult<String> {
         self.get_property(dataset, "encryptionroot")
     }
 
+    /// List every descendant under `root` that still reports a locked key.
     fn locked_descendants(&self, root: &str) -> LockchainResult<Vec<String>> {
         self.ensure_dataset_pool_ready(root)?;
 
@@ -299,6 +328,7 @@ impl ZfsProvider for SystemZfsProvider {
         Ok(locked)
     }
 
+    /// Load the key at `root`, retry locked descendants, and surface any stragglers.
     fn load_key_tree(&self, root: &str, key: &[u8]) -> LockchainResult<Vec<String>> {
         self.ensure_dataset_pool_ready(root)?;
         self.load_key(root, key)?;
@@ -333,6 +363,7 @@ impl ZfsProvider for SystemZfsProvider {
         Ok(unlocked)
     }
 
+    /// Describe the current key status for each dataset listed by the caller.
     fn describe_datasets(&self, datasets: &[String]) -> LockchainResult<KeyStatusSnapshot> {
         let mut snapshot = Vec::with_capacity(datasets.len());
         let mut checked_pools = HashSet::new();

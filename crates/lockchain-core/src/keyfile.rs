@@ -1,3 +1,5 @@
+//! Keyfile parsing and persistence helpers shared by CLI, daemon, and UI.
+
 use crate::error::{LockchainError, LockchainResult};
 use hex::FromHex;
 use std::fs;

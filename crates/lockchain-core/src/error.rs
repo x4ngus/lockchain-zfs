@@ -1,9 +1,12 @@
+//! Shared error codes and result aliases used throughout Lockchain core.
+
 use std::path::PathBuf;
 use thiserror::Error;
 
 /// Result alias for core operations.
 pub type LockchainResult<T> = Result<T, LockchainError>;
 
+/// Canonical error list for Lockchain operations.
 #[derive(Error, Debug)]
 pub enum LockchainError {
     #[error("[LC1000] io error: {0}")]
@@ -14,6 +17,9 @@ pub enum LockchainError {
 
     #[error("[LC1002] yaml config parse error: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    #[error("[LC1003] toml config serialization error: {0}")]
+    TomlSer(#[from] toml::ser::Error),
 
     #[error("[LC1100] configuration error: {0}")]
     InvalidConfig(String),
@@ -35,11 +41,13 @@ pub enum LockchainError {
 }
 
 impl LockchainError {
+    /// Return the stable LCxxxx code associated with this error variant.
     pub fn code(&self) -> &'static str {
         match self {
             LockchainError::Io(_) => "LC1000",
             LockchainError::Toml(_) => "LC1001",
             LockchainError::Yaml(_) => "LC1002",
+            LockchainError::TomlSer(_) => "LC1003",
             LockchainError::InvalidConfig(_) => "LC1100",
             LockchainError::DatasetNotConfigured(_) => "LC1200",
             LockchainError::MissingKeySource(_) => "LC1201",

@@ -1,67 +1,65 @@
-# Contributing // LockChain ZFS
+# Contributing Guide
 
-> _"We maintain the perimeter the way others maintain gardens."_  
-
-Welcome to the crew. This document explains how to collaborate without breaking the neon trance the project lives in. Read it once, bookmark it, and keep your PRs sharp.
+LockChain thrives when contributors treat the codebase like a security control: traceable, testable, and easy to reason about under pressure. This guide sets expectations so every change slots cleanly into the architecture and aesthetic we’ve chosen.
 
 ---
 
-## Signal Codes
+## Baseline Requirements
 
-- **Rust**: stable toolchain (`rustup toolchain install stable`)
-- **Coverage**: core crate ≥ 70% (`cargo tarpaulin --ignore-tests --workspace`)
-- **Style**: `cargo fmt` + `cargo clippy --all-targets -- -D warnings`
-- **Docs**: README + ADRs must stay fresh; any significant change ships with words
+- **Rust toolchain**: stable (`rustup toolchain install stable`)  
+- **Formatting & linting**: `cargo fmt` and `cargo clippy --all-targets -- -D warnings`  
+- **Coverage signal**: `cargo tarpaulin --workspace --ignore-tests` should keep the core crate ≥ 70%  
+- **Docs discipline**: README, ADRs, and relevant runbooks must reflect functional changes
 
-## First Contact
+## Getting Started
 
-1. Fork the repo and clone your fork.
-2. Run the smoke test to prove your environment:
+1. Fork and clone the repository.  
+2. Prove the environment by running the integration smoke test:
    ```bash
    cargo test -p lockchain-zfs --test unlock_smoke
    ```
-3. Install dependencies for optional surfaces:
+3. Install optional dependencies if you intend to touch the peripherals:
    - `libudev-dev` (or distro equivalent) for `lockchain-key-usb`
-   - `pkg-config`, `python3` for simulated provider tests
+   - `pkg-config`, `python3` for simulated provider tests and fixtures
 
-## Branch Ritual
+## Branching & Preflight Checklist
 
-Branches are named `feature/<codename>` or `fix/<issue>`. Keep commits focused and signed off if your workflow requires it.
-
-Before opening a PR:
+- Use `feature/<topic>` or `fix/<issue>` branch names; keep commits scoped and descriptive.  
+- Before opening a pull request run:
 
 ```bash
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 cargo test --workspace
-cargo tarpaulin --workspace --ignore-tests  # optional, but include the result in your PR
+cargo tarpaulin --workspace --ignore-tests  # include results in the PR when applicable
 ```
 
 ## Review Expectations
 
-- Every PR needs at least one test. Unit, integration, or smoke — dealer’s choice.
-- Keep log output JSON-friendly by default; respect existing logging abstractions.
-- Touching a config file? Update `docs/` or the ADRs as part of the change.
-- Try not to squash reviewers’ comments by force-pushing; rebase at the end.
+- Every change needs test coverage. Unit tests, integration tests, or targeted smoke tests are acceptable; explain your choice in the PR.  
+- Preserve structured logging; default to JSON output and respect existing log helpers.  
+- Touching configuration, security posture, or workflows requires documentation updates (README, runbooks, or ADRs).  
+- Address reviewer comments collaboratively; rebase or squash only when the discussion has settled.
 
-## DocOps
+## Documentation Rhythm
 
-The docs live under `docs/` and follow a neon-with-purpose tone. When you add a new subsystem or break an assumption, drop an ADR (`docs/adr/ADR-00X-*.md`) plus a callout in the README if user-facing.
+- Keep `docs/` aligned with behaviour. The style is “neon with intent”: professional tone with understated cyberpunk visuals.  
+- Record architectural or policy decisions in `docs/adr/ADR-00X-*.md`. Reference them from README or other docs when user-facing impact exists.
 
-## Issue Protocol
+## Issue Handling
 
-- **Bug report**: include dataset/CLI output, log snippet (with `LOCKCHAIN_LOG_FORMAT=plain` if helpful), and kernel/ZFS versions.
-- **Feature request**: open a discussion first if it impacts provider behaviour or security posture.
-- **Security findings**: see [`docs/SECURITY.md`](SECURITY.md) for the encrypted channel.
+- **Bug reports** should include: command output, relevant log snippets (set `LOCKCHAIN_LOG_FORMAT=plain` if it aids readability), kernel/ZFS versions, and reproduction notes.  
+- **Feature requests** benefit from an initial discussion thread, especially if the change reaches into provider behaviour or privilege boundaries.  
+- **Security reports** must follow the disclosure process in [`docs/SECURITY.md`](SECURITY.md); avoid public issues for vulnerabilities.
 
-## Release Cadence
+## Release Workflow (maintainers)
 
-1. Update `docs/CHANGELOG.md`.
-2. Tag releases `vX.Y.Z`.
-3. Attach binary artefacts only when the CLI surface changes.
+1. Update `docs/CHANGELOG.md` with a concise entry.  
+2. Bump versions as needed and tag `vX.Y.Z`.  
+3. The release workflow produces signed `.deb` packages automatically; attach additional artefacts only when necessary.
 
-## Appreciation
+## Thank You
 
-Thanks for helping keep the vaults locked. Add yourself to `docs/CONTRIBUTORS.md` (feel free to create it if you’re first) and drop into the discussions to keep the neon chat alive.
+Add yourself to `docs/CONTRIBUTORS.md` (create it if blank), stay active in discussions, and keep the glow consistent. Together we keep the vault resilient.
 
-— The LockChain maintainers 🛡️
+— LockChain maintainers

@@ -1,3 +1,5 @@
+//! Configuration model and helpers used by Lockchain services.
+
 use crate::error::{LockchainError, LockchainResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -7,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 const KEY_PATH_ENV: &str = "LOCKCHAIN_KEY_PATH";
 
+/// Describes which datasets we manage and the paths to supporting tooling.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Policy {
     pub datasets: Vec<String>,
@@ -24,6 +27,7 @@ pub struct Policy {
     pub allow_root: bool,
 }
 
+/// Timeouts and other crypto-related knobs for CLI interactions.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CryptoCfg {
     #[serde(default = "default_timeout_secs")]
@@ -42,6 +46,7 @@ impl Default for CryptoCfg {
     }
 }
 
+/// USB token expectations, including mount behaviour and checksum checks.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Usb {
     #[serde(default = "default_usb_key_path")]
@@ -88,6 +93,7 @@ impl Default for Usb {
     }
 }
 
+/// Fallback passphrase tuning for emergency unlocks.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Fallback {
     #[serde(default)]
@@ -126,6 +132,7 @@ impl Default for Fallback {
     }
 }
 
+/// Shared retry/backoff strategy used by higher level workflows.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RetryCfg {
     #[serde(default = "default_retry_attempts")]
@@ -168,6 +175,7 @@ impl Default for RetryCfg {
     }
 }
 
+/// Top-level configuration snapshot loaded from disk.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LockchainConfig {
     pub policy: Policy,
@@ -186,20 +194,45 @@ pub struct LockchainConfig {
 
     #[serde(skip)]
     pub path: PathBuf,
+
+    #[serde(skip)]
+    pub format: ConfigFormat,
+}
+
+/// Tracks whether we parsed TOML or YAML so writes preserve format.
+#[derive(Debug, Clone, Copy)]
+pub enum ConfigFormat {
+    Toml,
+    Yaml,
+}
+
+impl Default for ConfigFormat {
+    fn default() -> Self {
+        ConfigFormat::Toml
+    }
 }
 
 impl LockchainConfig {
+    /// Read a config file from disk, detect format, and validate basics.
     pub fn load<P: AsRef<Path>>(path: P) -> LockchainResult<Self> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path)?;
-        let mut cfg = if matches!(path.extension().and_then(|ext| ext.to_str()), Some(ext) if ext.eq_ignore_ascii_case("toml"))
-        {
+        let is_toml = matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some(ext) if ext.eq_ignore_ascii_case("toml")
+        );
+        let mut cfg = if is_toml {
             toml::from_str::<Self>(&contents)?
         } else {
             serde_yaml::from_str::<Self>(&contents)?
         };
 
         cfg.path = path.to_path_buf();
+        cfg.format = if is_toml {
+            ConfigFormat::Toml
+        } else {
+            ConfigFormat::Yaml
+        };
 
         if cfg.policy.datasets.is_empty() {
             return Err(LockchainError::InvalidConfig(
@@ -210,10 +243,12 @@ impl LockchainConfig {
         Ok(cfg)
     }
 
+    /// Returns true when `dataset` is listed under `policy.datasets`.
     pub fn contains_dataset(&self, dataset: &str) -> bool {
         self.policy.datasets.iter().any(|d| d == dataset)
     }
 
+    /// Perform a best-effort validation pass and return human-readable issues.
     pub fn validate(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
@@ -269,6 +304,7 @@ impl LockchainConfig {
         issues
     }
 
+    /// Resolve the path where the USB key material should live.
     pub fn key_hex_path(&self) -> PathBuf {
         if let Ok(override_path) = env::var(KEY_PATH_ENV) {
             if !override_path.is_empty() {
@@ -278,20 +314,34 @@ impl LockchainConfig {
         PathBuf::from(&self.usb.key_hex_path)
     }
 
+    /// Translate the stored timeout into a `Duration`.
     pub fn zfs_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.crypto.timeout_secs)
     }
 
+    /// Optional override for the `zfs` CLI path.
     pub fn zfs_binary_path(&self) -> Option<PathBuf> {
         self.policy.zfs_path.as_ref().map(PathBuf::from)
     }
 
+    /// Optional override for the `zpool` CLI path.
     pub fn zpool_binary_path(&self) -> Option<PathBuf> {
         self.policy.zpool_path.as_ref().map(PathBuf::from)
     }
 
+    /// Access the shared retry configuration helpers rely on.
     pub fn retry_config(&self) -> &RetryCfg {
         &self.retry
+    }
+
+    /// Persist the configuration back to its original on-disk format.
+    pub fn save(&self) -> LockchainResult<()> {
+        let payload = match self.format {
+            ConfigFormat::Toml => toml::to_string_pretty(self)?,
+            ConfigFormat::Yaml => serde_yaml::to_string(self)?,
+        };
+        fs::write(&self.path, payload)?;
+        Ok(())
     }
 }
 
@@ -337,6 +387,7 @@ mod tests {
             fallback: Fallback::default(),
             retry: RetryCfg::default(),
             path: PathBuf::new(),
+            format: ConfigFormat::Toml,
         };
 
         let guard = EnvGuard::set(KEY_PATH_ENV, "/tmp/override.key");

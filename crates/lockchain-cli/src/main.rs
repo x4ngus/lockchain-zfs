@@ -1,3 +1,5 @@
+//! Lockchain command-line interface: provisioning, maintenance, and unlock tooling.
+
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use lockchain_core::{
@@ -5,6 +7,7 @@ use lockchain_core::{
     keyfile::write_raw_key_file,
     logging,
     provider::{DatasetKeyDescriptor, KeyState},
+    workflow::{self, ForgeMode, ProvisionOptions, WorkflowLevel, WorkflowReport},
     LockchainConfig, LockchainService, UnlockOptions,
 };
 use lockchain_zfs::SystemZfsProvider;
@@ -19,6 +22,7 @@ use std::sync::Arc;
 
 mod tui;
 
+/// Top-level command-line options shared by every subcommand.
 #[derive(Parser, Debug)]
 #[command(
     name = "lockchain",
@@ -34,8 +38,46 @@ struct Cli {
     command: Commands,
 }
 
+/// Subcommands covering the full lifecycle of a Lockchain deployment.
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Provision a USB token with raw key material and refresh initramfs assets.
+    Init {
+        /// Target dataset; defaults to the first entry in policy.datasets.
+        dataset: Option<String>,
+
+        /// USB block device (e.g. /dev/sdb1). When omitted, autodetect via label/UUID.
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Mountpoint used during provisioning.
+        #[arg(long)]
+        mount: Option<PathBuf>,
+
+        /// Filename to write inside the mounted token (default: key.hex).
+        #[arg(long)]
+        filename: Option<String>,
+
+        /// Optional fallback passphrase material to configure immediately.
+        #[arg(long)]
+        passphrase: Option<String>,
+
+        /// Perform a non-destructive safety check instead of wiping the token.
+        #[arg(long)]
+        safe: bool,
+
+        /// Force a wipe even in safe mode.
+        #[arg(long)]
+        force_wipe: bool,
+
+        /// Skip initramfs rebuild after provisioning.
+        #[arg(long)]
+        no_rebuild: bool,
+    },
+
+    /// Run diagnostics and remediation to keep the environment healthy.
+    Doctor,
+
     /// Unlock an encrypted dataset (and its descendants).
     Unlock {
         /// Target dataset; defaults to the first entry in policy.datasets.
@@ -57,6 +99,19 @@ enum Commands {
         #[arg(long)]
         key_file: Option<PathBuf>,
     },
+
+    /// Perform a self-test using an ephemeral ZFS pool.
+    SelfTest {
+        /// Dataset to validate; defaults to the first entry in policy.datasets.
+        dataset: Option<String>,
+
+        /// Require the USB token and skip fallback handling during the drill.
+        #[arg(long)]
+        strict_usb: bool,
+    },
+
+    /// Reinstall mount/unlock systemd units and ensure services are enabled.
+    Repair,
 
     /// Show keystatus information for a dataset (or all managed datasets).
     Status {
@@ -100,6 +155,7 @@ enum Commands {
     },
 }
 
+/// Entry point: parse arguments and surface errors with an exit code.
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -107,12 +163,60 @@ fn main() {
     }
 }
 
+/// Dispatch to the requested subcommand and map results into rich output.
 fn run() -> Result<()> {
     logging::init("info");
     let cli = Cli::parse();
     let config_path = cli.config.clone();
 
     match cli.command {
+        Commands::Init {
+            dataset,
+            device,
+            mount,
+            filename,
+            passphrase,
+            safe,
+            force_wipe,
+            no_rebuild,
+        } => {
+            let mut config = LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?;
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let target = resolve_dataset(dataset, &config.policy)?;
+            let mut options = ProvisionOptions::default();
+            options.usb_device = device;
+            options.mountpoint = mount;
+            options.key_filename = filename;
+            options.passphrase = passphrase;
+            options.force_wipe = force_wipe;
+            options.rebuild_initramfs = !no_rebuild;
+            let mode = if safe {
+                ForgeMode::Safe
+            } else {
+                ForgeMode::Standard
+            };
+            let report = workflow::forge_key(&mut config, &provider, &target, mode, options)
+                .map_err(anyhow::Error::new)?;
+            print_report(report);
+            return Ok(());
+        }
+        Commands::Doctor => {
+            let config = LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?;
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let report = workflow::doctor(&config, provider).map_err(anyhow::Error::new)?;
+            print_report(report);
+            return Ok(());
+        }
         Commands::Validate { file, schema } => {
             if schema {
                 let schema = schema_for!(LockchainConfig);
@@ -206,6 +310,34 @@ fn run() -> Result<()> {
                 "Emergency key material written to {} (permissions set to 0400). Remember to securely delete this file when finished.",
                 output.display()
             );
+            return Ok(());
+        }
+        Commands::SelfTest {
+            dataset,
+            strict_usb,
+        } => {
+            let config = LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?;
+            let provider = SystemZfsProvider::from_config(&config)?;
+            let target = resolve_dataset(dataset, &config.policy)?;
+            let report = workflow::self_test(&config, provider, &target, strict_usb)
+                .map_err(anyhow::Error::new)?;
+            print_report(report);
+            return Ok(());
+        }
+        Commands::Repair => {
+            let config = LockchainConfig::load(&config_path).with_context(|| {
+                format!(
+                    "failed to load configuration from {}",
+                    config_path.display()
+                )
+            })?;
+            let report = workflow::repair_environment(&config).map_err(anyhow::Error::new)?;
+            print_report(report);
             return Ok(());
         }
         Commands::Unlock {
@@ -328,6 +460,26 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+/// Pretty-print a workflow report so humans can follow along.
+fn print_report(report: WorkflowReport) {
+    println!("{}", report.title);
+    for event in report.events {
+        println!("  [{}] {}", level_tag(event.level), event.message);
+    }
+}
+
+/// Short tag used when printing workflow severity levels.
+fn level_tag(level: WorkflowLevel) -> &'static str {
+    match level {
+        WorkflowLevel::Info => "INFO",
+        WorkflowLevel::Success => "OK",
+        WorkflowLevel::Warn => "WARN",
+        WorkflowLevel::Error => "ERR",
+        WorkflowLevel::Security => "SEC",
+    }
+}
+
+/// Pick a dataset from CLI input or fall back to the first policy entry.
 fn resolve_dataset(dataset: Option<String>, policy: &Policy) -> Result<String> {
     if let Some(ds) = dataset {
         return Ok(ds);
@@ -339,6 +491,7 @@ fn resolve_dataset(dataset: Option<String>, policy: &Policy) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no datasets configured in policy.datasets"))
 }
 
+/// Render a simple table describing current key status across datasets.
 fn print_key_table(snapshot: Vec<DatasetKeyDescriptor>) {
     println!("{:<32} {:<32} {}", "DATASET", "ENCRYPTION ROOT", "STATUS");
     for entry in snapshot {

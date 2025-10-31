@@ -1,3 +1,5 @@
+//! Lightweight logging bootstrapper shared by every Lockchain binary.
+
 use env_logger::Env;
 use serde_json::json;
 use std::env;

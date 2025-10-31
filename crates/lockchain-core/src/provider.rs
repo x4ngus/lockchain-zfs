@@ -1,3 +1,5 @@
+//! Abstractions that describe how we talk to ZFS providers and report their state.
+
 use crate::error::LockchainResult;
 
 /// Normalised keystatus for a dataset.

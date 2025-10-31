@@ -1,3 +1,5 @@
+//! High-level unlock service that coordinates config, providers, and key sources.
+
 use crate::config::LockchainConfig;
 use crate::error::{LockchainError, LockchainResult};
 use crate::keyfile::{read_key_file, write_raw_key_file};
@@ -39,20 +41,24 @@ pub struct DatasetStatus {
     pub locked_descendants: Vec<String>,
 }
 
+/// Coordinates configuration, providers, and key sources to unlock datasets.
 pub struct LockchainService<P: ZfsProvider> {
     config: Arc<LockchainConfig>,
     provider: P,
 }
 
 impl<P: ZfsProvider> LockchainService<P> {
+    /// Build a service with shared configuration and a concrete provider implementation.
     pub fn new(config: Arc<LockchainConfig>, provider: P) -> Self {
         Self { config, provider }
     }
 
+    /// Attempt to unlock `dataset` once, returning a report of what changed.
     pub fn unlock(&self, dataset: &str, options: UnlockOptions) -> LockchainResult<UnlockReport> {
         self.perform_unlock(dataset, options)
     }
 
+    /// Unlock `dataset` with exponential backoff guided by retry policy.
     pub fn unlock_with_retry(
         &self,
         dataset: &str,
@@ -89,6 +95,7 @@ impl<P: ZfsProvider> LockchainService<P> {
         }
     }
 
+    /// Internal helper shared by the eager and retrying unlock paths.
     fn perform_unlock(
         &self,
         dataset: &str,
@@ -128,6 +135,7 @@ impl<P: ZfsProvider> LockchainService<P> {
         })
     }
 
+    /// Summarise the current keystatus for `dataset` and its encryption root.
     pub fn status(&self, dataset: &str) -> LockchainResult<DatasetStatus> {
         if !self.config.contains_dataset(dataset) {
             return Err(LockchainError::DatasetNotConfigured(dataset.to_string()));
@@ -146,11 +154,13 @@ impl<P: ZfsProvider> LockchainService<P> {
         })
     }
 
+    /// Pull keystatus for every dataset declared in the policy.
     pub fn list_keys(&self) -> LockchainResult<KeyStatusSnapshot> {
         self.provider
             .describe_datasets(&self.config.policy.datasets)
     }
 
+    /// Locate or derive key material according to the supplied unlock options.
     fn key_material(
         &self,
         dataset: &str,
@@ -193,6 +203,7 @@ impl<P: ZfsProvider> LockchainService<P> {
         Ok(key)
     }
 
+    /// Read and normalise key material stored on disk.
     fn load_usb_key(&self, path: &Path) -> LockchainResult<Zeroizing<Vec<u8>>> {
         let (key, converted) = read_key_file(path)?;
         if converted {
@@ -201,6 +212,7 @@ impl<P: ZfsProvider> LockchainService<P> {
         Ok(key)
     }
 
+    /// Make sure the loaded key matches the expected checksum when configured.
     fn verify_checksum(&self, key: &[u8]) -> LockchainResult<()> {
         if let Some(expected) = &self.config.usb.expected_sha256 {
             let digest = Sha256::digest(key);
@@ -217,6 +229,7 @@ impl<P: ZfsProvider> LockchainService<P> {
         Ok(())
     }
 
+    /// Derive the fallback key using the configured PBKDF2 parameters and mask.
     pub fn derive_fallback_key(&self, passphrase: &[u8]) -> LockchainResult<Zeroizing<Vec<u8>>> {
         let fallback = &self.config.fallback;
         let salt_hex = fallback.passphrase_salt.as_ref().ok_or_else(|| {
@@ -257,7 +270,9 @@ impl<P: ZfsProvider> LockchainService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CryptoCfg, Fallback, LockchainConfig, Policy, RetryCfg, Usb};
+    use crate::config::{
+        ConfigFormat, CryptoCfg, Fallback, LockchainConfig, Policy, RetryCfg, Usb,
+    };
     use crate::provider::{DatasetKeyDescriptor, KeyState, KeyStatusSnapshot, ZfsProvider};
     use std::collections::HashSet;
     use std::fs;
@@ -360,6 +375,7 @@ mod tests {
             },
             retry: RetryCfg::default(),
             path: key_path.clone(),
+            format: ConfigFormat::Toml,
         }
     }
 

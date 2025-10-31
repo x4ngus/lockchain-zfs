@@ -20,9 +20,14 @@ install -d -o lockchain -g lockchain /var/lib/lockchain
 
 install -Dm644 "$ROOT_DIR/systemd/lockchain-zfs.service" "$SYSTEMD_DIR/lockchain-zfs.service"
 install -Dm644 "$ROOT_DIR/systemd/lockchain-zfs@.service" "$SYSTEMD_DIR/lockchain-zfs@.service"
+install -Dm644 "$ROOT_DIR/systemd/lockchain-key-usb.service" "$SYSTEMD_DIR/lockchain-key-usb.service"
+
+install -d -m 0755 /run/lockchain
 
 systemctl daemon-reload
 systemctl enable lockchain-zfs.service
+systemctl enable lockchain-key-usb.service
 
 echo "lockchain-zfs.service enabled under user 'lockchain'."
+echo "lockchain-key-usb.service enabled to monitor the USB token."
 echo "Enable dataset units with: systemctl enable lockchain-zfs@<dataset>.service"

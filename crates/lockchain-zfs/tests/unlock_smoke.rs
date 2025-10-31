@@ -1,4 +1,6 @@
-use lockchain_core::config::{CryptoCfg, Fallback, LockchainConfig, Policy, RetryCfg, Usb};
+use lockchain_core::config::{
+    ConfigFormat, CryptoCfg, Fallback, LockchainConfig, Policy, RetryCfg, Usb,
+};
 use lockchain_core::service::{LockchainService, UnlockOptions};
 use lockchain_core::LockchainResult;
 use lockchain_zfs::SystemZfsProvider;
@@ -148,6 +150,7 @@ fn unlock_smoke_unlocks_dev_pool() -> LockchainResult<()> {
         },
         retry: RetryCfg::default(),
         path: PathBuf::from("/etc/lockchain-zfs.toml"),
+        format: ConfigFormat::Toml,
     });
 
     let provider = SystemZfsProvider::from_config(&config)?;

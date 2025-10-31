@@ -1,46 +1,91 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+//! Desktop control deck built with Iced to steer Lockchain workflows.
 
-use chrono::Utc;
-use iced::alignment::{Horizontal, Vertical};
-use iced::theme;
-use iced::widget::{
-    self, button, column, container, image, row, scrollable, stack, text, text_input, toggler,
-    Space,
-};
-use iced::{border, Background, Color, Element, Length, Size, Task, Theme};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use chrono::Local;
+use iced::alignment::Vertical;
+use iced::border::{Border, Radius};
+use iced::widget::button;
+use iced::widget::button::{Status as ButtonStatus, Style as ButtonStyle};
+use iced::widget::{column, container, row, scrollable, text, text_input, toggler, Space};
+use iced::{application, Font, Length, Size, Task, Theme};
 use lockchain_core::config::LockchainConfig;
-use lockchain_core::error::LockchainError;
-use lockchain_core::provider::{DatasetKeyDescriptor, KeyState};
-use lockchain_core::service::{LockchainService, UnlockOptions};
+use lockchain_core::workflow::{
+    self, ForgeMode, ProvisionOptions, WorkflowEvent, WorkflowLevel, WorkflowReport,
+};
 use lockchain_zfs::SystemZfsProvider;
 
-const DEFAULT_CONFIG: &str = "/etc/lockchain-zfs.toml";
-const LOGO_BYTES: &[u8] = include_bytes!("../../../assets/logos/lockchain-logo-square.png");
-
+/// Launch the Iced application with the Lockchain-specific theme and state.
 pub fn main() -> iced::Result {
     lockchain_core::logging::init("info");
-    iced::application(
+    application(
         "LockChain Control Deck",
         LockchainUi::update,
         LockchainUi::view,
     )
+    .default_font(Font::with_name("JetBrains Mono"))
     .antialiasing(true)
-    .window_size(Size::new(1120.0, 720.0))
+    .window_size(Size::new(1280.0, 768.0))
     .theme(LockchainUi::theme)
     .run_with(LockchainUi::init)
 }
 
-#[derive(Debug, Clone)]
-struct LogEntry {
-    level: LogLevel,
-    message: String,
+/// Actions the operator can trigger from the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Directive {
+    NewKey,
+    NewKeySafe,
+    SelfTest,
+    RecoverKey,
+    SelfHeal,
+    Doctor,
 }
 
+/// Metadata used to render directive cards.
+struct DirectiveEntry {
+    directive: Directive,
+    title: &'static str,
+    subtitle: &'static str,
+}
+
+/// List of all available directives shown in the control deck.
+const DIRECTIVES: &[DirectiveEntry] = &[
+    DirectiveEntry {
+        directive: Directive::NewKey,
+        title: "New Key",
+        subtitle: "Forge fresh USB key material",
+    },
+    DirectiveEntry {
+        directive: Directive::NewKeySafe,
+        title: "New Key (Safe mode)",
+        subtitle: "Guided forge with confirmations",
+    },
+    DirectiveEntry {
+        directive: Directive::SelfTest,
+        title: "Self-test",
+        subtitle: "Drill unlock + keystatus verification",
+    },
+    DirectiveEntry {
+        directive: Directive::RecoverKey,
+        title: "Recover Key",
+        subtitle: "Derive fallback key from passphrase",
+    },
+    DirectiveEntry {
+        directive: Directive::SelfHeal,
+        title: "Self-heal Issues",
+        subtitle: "Diagnose key material and dataset state",
+    },
+    DirectiveEntry {
+        directive: Directive::Doctor,
+        title: "Doctor",
+        subtitle: "Full system audit & remediation tips",
+    },
+];
+
+/// Visual severity mapping for workflow events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogLevel {
+enum ActivityLevel {
     Info,
     Success,
     Warn,
@@ -48,749 +93,917 @@ enum LogLevel {
     Security,
 }
 
-impl LogLevel {
-    fn color(self) -> Color {
+impl ActivityLevel {
+    /// Short label used in status chips.
+    fn label(self) -> &'static str {
         match self {
-            LogLevel::Info => Color::from_rgb8(0x67, 0xd6, 0xff),
-            LogLevel::Success => Color::from_rgb8(0x8a, 0xff, 0x70),
-            LogLevel::Warn => Color::from_rgb8(0xff, 0xc1, 0x29),
-            LogLevel::Error => Color::from_rgb8(0xff, 0x47, 0x80),
-            LogLevel::Security => Color::from_rgb8(0xff, 0x73, 0xff),
+            ActivityLevel::Info => "INFO",
+            ActivityLevel::Success => "SUCCESS",
+            ActivityLevel::Warn => "WARN",
+            ActivityLevel::Error => "ERROR",
+            ActivityLevel::Security => "SECURE",
+        }
+    }
+
+    /// Theme color associated with each activity level.
+    fn color(self) -> iced::Color {
+        match self {
+            ActivityLevel::Info => iced::Color::from_rgb8(0x67, 0xd6, 0xff),
+            ActivityLevel::Success => iced::Color::from_rgb8(0x8a, 0xff, 0x70),
+            ActivityLevel::Warn => iced::Color::from_rgb8(0xff, 0xc1, 0x29),
+            ActivityLevel::Error => iced::Color::from_rgb8(0xff, 0x47, 0x80),
+            ActivityLevel::Security => iced::Color::from_rgb8(0xff, 0x73, 0xff),
         }
     }
 }
 
-#[derive(Debug, Clone)]
-enum ModalState {
-    None,
-    Passphrase {
-        dataset: String,
-        value: String,
-        error: Option<String>,
-    },
-    BreakglassConfirmName {
-        dataset: String,
-        input: String,
-    },
-    BreakglassConfirmPhrase {
-        dataset: String,
-        input: String,
-    },
-    BreakglassPassphrase {
-        dataset: String,
-        output_path: String,
-        passphrase: String,
-        error: Option<String>,
-    },
-    BreakglassComplete {
-        dataset: String,
-        output_path: PathBuf,
-    },
+impl From<WorkflowLevel> for ActivityLevel {
+    fn from(level: WorkflowLevel) -> Self {
+        match level {
+            WorkflowLevel::Info => ActivityLevel::Info,
+            WorkflowLevel::Success => ActivityLevel::Success,
+            WorkflowLevel::Warn => ActivityLevel::Warn,
+            WorkflowLevel::Error => ActivityLevel::Error,
+            WorkflowLevel::Security => ActivityLevel::Security,
+        }
+    }
 }
 
+/// Normalised activity entry displayed in the timeline.
 #[derive(Debug, Clone)]
-enum Message {
-    StatusLoaded(Result<Vec<DatasetKeyDescriptor>, String>),
-    Refresh,
-    ToggleStrict(bool),
-    Unlock(String),
-    UnlockFinished {
-        dataset: String,
-        result: Result<Vec<String>, String>,
-    },
-    PassphraseInput(String),
-    SubmitPassphrase,
-    CancelModal,
-    PassphraseUnlockFinished {
-        dataset: String,
-        result: Result<Vec<String>, String>,
-    },
-    ShowBreakglass(String),
-    BreakglassNameInput(String),
-    ConfirmBreakglassName,
-    BreakglassPhraseInput(String),
-    ConfirmBreakglassPhrase,
-    BreakglassPassphraseInput(String),
-    BreakglassOutputInput(String),
-    ExecuteBreakglass,
-    BreakglassFinished {
-        dataset: String,
-        result: Result<PathBuf, String>,
-    },
+struct ActivityItem {
+    timestamp: String,
+    level: ActivityLevel,
+    message: String,
 }
 
+/// Application state backing the UI, including current directive and logs.
+#[derive(Debug)]
 struct LockchainUi {
     config_path: PathBuf,
-    datasets: Vec<DatasetKeyDescriptor>,
-    logs: Vec<LogEntry>,
-    strict_usb: bool,
-    modal: ModalState,
-    loading: bool,
+    active_directive: Directive,
+    secure_mode: bool,
+    terminal_input: String,
+    activity: Vec<ActivityItem>,
+    executing: bool,
+    pending_directive: Option<Directive>,
+    status_line: String,
+    total_events: usize,
+    key_present: bool,
+}
+
+/// Messages produced by Iced interactions and background tasks.
+#[derive(Debug, Clone)]
+enum Message {
+    DirectiveSelected(Directive),
+    TerminalChanged(String),
+    Execute,
+    WorkflowFinished(Result<WorkflowReport, String>),
+    ToggleSecure(bool),
+    HelpPressed,
+    KillSwitchPressed,
+    Refresh,
 }
 
 impl LockchainUi {
+    /// Construct initial UI state and schedule no async work.
     fn init() -> (Self, Task<Message>) {
         let config_path = std::env::var("LOCKCHAIN_CONFIG")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG));
+            .unwrap_or_else(|_| PathBuf::from("/etc/lockchain-zfs.toml"));
 
-        let state = Self {
-            config_path: config_path.clone(),
-            datasets: Vec::new(),
-            logs: Vec::new(),
-            strict_usb: false,
-            modal: ModalState::None,
-            loading: true,
+        let mut ui = Self {
+            config_path,
+            active_directive: Directive::NewKey,
+            secure_mode: false,
+            terminal_input: String::new(),
+            activity: Vec::new(),
+            executing: false,
+            pending_directive: None,
+            status_line: "Monitoring".into(),
+            total_events: 0,
+            key_present: false,
         };
 
-        let task = Task::perform(load_status(config_path), Message::StatusLoaded);
-
-        (state, task)
+        ui.push_activity(
+            ActivityLevel::Info,
+            "Control Deck online. Select a directive to begin.",
+        );
+        ui.key_present = ui.detect_key_presence();
+        (ui, Task::none())
     }
 
-    fn update(state: &mut Self, message: Message) -> Task<Message> {
-        state.handle(message)
-    }
-
-    fn view(state: &Self) -> Element<'_, Message> {
-        state.render()
-    }
-
-    fn theme(state: &Self) -> Theme {
-        state.palette()
-    }
-
-    fn palette(&self) -> Theme {
-        Theme::custom(
-            String::from("lockchain-neon"),
-            theme::Palette {
-                background: Color::from_rgb8(0x05, 0x08, 0x1f),
-                text: Color::from_rgb8(0xe7, 0xff, 0xff),
-                primary: Color::from_rgb8(0x24, 0xd0, 0xff),
-                success: Color::from_rgb8(0x8a, 0xff, 0x70),
-                danger: Color::from_rgb8(0xff, 0x47, 0x80),
-            },
-        )
-    }
-
-    fn handle(&mut self, message: Message) -> Task<Message> {
+    /// React to UI events and kick off any background tasks.
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::StatusLoaded(result) => {
-                self.loading = false;
-                match result {
-                    Ok(list) => {
-                        self.datasets = list;
-                        self.push_log(LogLevel::Info, "Dataset status updated");
-                    }
-                    Err(err) => {
-                        self.push_log(LogLevel::Error, format!("Failed to load datasets: {err}"));
-                    }
+            Message::DirectiveSelected(directive) => {
+                if !self.executing {
+                    self.active_directive = directive;
+                    self.status_line = directive_title(directive).into();
                 }
                 Task::none()
             }
-            Message::Refresh => {
-                self.loading = true;
-                Task::perform(load_status(self.config_path.clone()), Message::StatusLoaded)
+            Message::TerminalChanged(value) => {
+                self.terminal_input = value;
+                Task::none()
             }
-            Message::ToggleStrict(value) => {
-                self.strict_usb = value;
-                self.push_log(
-                    LogLevel::Info,
-                    if value {
-                        "Strict USB mode engaged"
+            Message::ToggleSecure(state) => {
+                self.secure_mode = state;
+                self.push_activity(
+                    ActivityLevel::Info,
+                    if state {
+                        "Strict USB mode engaged."
                     } else {
-                        "Strict USB mode disengaged"
-                    }
-                    .to_string(),
+                        "Strict USB mode disengaged."
+                    },
                 );
                 Task::none()
             }
-            Message::Unlock(dataset) => {
-                self.loading = true;
-                self.push_log(LogLevel::Info, format!("Unlock requested for {dataset}"));
-                let config_path = self.config_path.clone();
-                let strict_usb = self.strict_usb;
-                let dataset_for_future = dataset.clone();
+            Message::Execute => {
+                if self.executing {
+                    return Task::none();
+                }
+                if !self.directive_enabled(self.active_directive) {
+                    self.push_activity(
+                        ActivityLevel::Warn,
+                        "Forge or insert a LockChain key before running this directive.",
+                    );
+                    return Task::none();
+                }
+                self.executing = true;
+                self.pending_directive = Some(self.active_directive);
+                self.push_activity(
+                    ActivityLevel::Info,
+                    format!("Executing {}", directive_title(self.active_directive)),
+                );
                 Task::perform(
-                    unlock_dataset(config_path, dataset_for_future, strict_usb, None),
-                    move |result| Message::UnlockFinished {
-                        dataset: dataset.clone(),
-                        result,
-                    },
+                    run_directive(
+                        self.config_path.clone(),
+                        self.active_directive,
+                        self.secure_mode,
+                        self.terminal_input.clone(),
+                    ),
+                    Message::WorkflowFinished,
                 )
             }
-            Message::UnlockFinished { dataset, result } => {
-                self.loading = false;
+            Message::WorkflowFinished(result) => {
+                self.executing = false;
+                let directive = self
+                    .pending_directive
+                    .take()
+                    .unwrap_or(self.active_directive);
                 match result {
-                    Ok(unlocked) => {
-                        if unlocked.is_empty() {
-                            self.push_log(
-                                LogLevel::Success,
-                                format!("Dataset {dataset} already unlocked"),
-                            );
-                        } else {
-                            self.push_log(
-                                LogLevel::Success,
-                                format!("Unlocked {} ({} datasets)", dataset, unlocked.len()),
-                            );
-                        }
-                        return Task::perform(
-                            load_status(self.config_path.clone()),
-                            Message::StatusLoaded,
+                    Ok(report) => {
+                        self.push_activity(
+                            ActivityLevel::Success,
+                            format!("{} complete", report.title),
                         );
-                    }
-                    Err(err) => {
-                        if err.contains("MissingKeySource") {
-                            self.modal = ModalState::Passphrase {
-                                dataset,
-                                value: String::new(),
-                                error: None,
-                            };
-                            self.push_log(
-                                LogLevel::Warn,
-                                "USB key missing; passphrase required".to_string(),
-                            );
+                        self.ingest_events(report.events);
+                        if matches!(directive, Directive::NewKey | Directive::NewKeySafe) {
+                            self.status_line = "Forge complete".into();
+                            self.key_present = true;
                         } else {
-                            self.push_log(LogLevel::Error, format!("Unlock failed: {err}"));
+                            self.status_line = "Monitoring".into();
                         }
                     }
-                }
-                Task::none()
-            }
-            Message::PassphraseInput(value) => {
-                if let ModalState::Passphrase { dataset, error, .. } = &mut self.modal {
-                    self.modal = ModalState::Passphrase {
-                        dataset: dataset.clone(),
-                        value,
-                        error: error.clone(),
-                    };
-                }
-                Task::none()
-            }
-            Message::SubmitPassphrase => {
-                if let ModalState::Passphrase { dataset, value, .. } = &self.modal {
-                    let dataset_name = dataset.clone();
-                    let pass = value.clone();
-                    if pass.is_empty() {
-                        return Task::none();
-                    }
-                    self.loading = true;
-                    self.modal = ModalState::None;
-                    return Task::perform(
-                        unlock_dataset(
-                            self.config_path.clone(),
-                            dataset_name.clone(),
-                            self.strict_usb,
-                            Some(pass),
-                        ),
-                        move |result| Message::PassphraseUnlockFinished {
-                            dataset: dataset_name.clone(),
-                            result,
-                        },
-                    );
-                }
-                Task::none()
-            }
-            Message::PassphraseUnlockFinished { dataset, result } => {
-                self.loading = false;
-                match result {
-                    Ok(_) => {
-                        self.push_log(
-                            LogLevel::Success,
-                            format!("Unlock successful with passphrase for {dataset}"),
-                        );
-                        return Task::perform(
-                            load_status(self.config_path.clone()),
-                            Message::StatusLoaded,
-                        );
-                    }
                     Err(err) => {
-                        self.push_log(LogLevel::Error, format!("Passphrase unlock failed: {err}"));
+                        self.push_activity(ActivityLevel::Error, err);
+                        self.status_line = "Check diagnostics".into();
                     }
                 }
+                self.key_present = self.detect_key_presence();
                 Task::none()
             }
-            Message::CancelModal => {
-                self.modal = ModalState::None;
+            Message::HelpPressed => {
+                self.push_activity(
+                    ActivityLevel::Info,
+                    help_text(self.active_directive).to_string(),
+                );
                 Task::none()
             }
-            Message::ShowBreakglass(dataset) => {
-                self.modal = ModalState::BreakglassConfirmName {
-                    dataset,
-                    input: String::new(),
-                };
+            Message::KillSwitchPressed => {
+                self.push_activity(
+                    ActivityLevel::Warn,
+                    "Killswitch placeholder: integrate ZFS unload-key workflow.",
+                );
                 Task::none()
             }
-            Message::BreakglassNameInput(value) => {
-                if let ModalState::BreakglassConfirmName { dataset, .. } = &self.modal {
-                    self.modal = ModalState::BreakglassConfirmName {
-                        dataset: dataset.clone(),
-                        input: value,
-                    };
+            Message::Refresh => {
+                if self.executing {
+                    return Task::none();
                 }
-                Task::none()
-            }
-            Message::ConfirmBreakglassName => {
-                if let ModalState::BreakglassConfirmName { dataset, input } = &self.modal {
-                    if &input.trim().to_string() == dataset {
-                        self.modal = ModalState::BreakglassConfirmPhrase {
-                            dataset: dataset.clone(),
-                            input: String::new(),
-                        };
-                    }
-                }
-                Task::none()
-            }
-            Message::BreakglassPhraseInput(value) => {
-                if let ModalState::BreakglassConfirmPhrase { dataset, .. } = &self.modal {
-                    self.modal = ModalState::BreakglassConfirmPhrase {
-                        dataset: dataset.clone(),
-                        input: value,
-                    };
-                }
-                Task::none()
-            }
-            Message::ConfirmBreakglassPhrase => {
-                if let ModalState::BreakglassConfirmPhrase { dataset, input } = &self.modal {
-                    if input.trim() == "BREAKGLASS" {
-                        let default_path = format!(
-                            "/var/lib/lockchain/{}_{}.key",
-                            dataset.replace('/', "-"),
-                            Utc::now().format("%Y%m%d%H%M%S")
-                        );
-                        self.modal = ModalState::BreakglassPassphrase {
-                            dataset: dataset.clone(),
-                            output_path: default_path,
-                            passphrase: String::new(),
-                            error: None,
-                        };
-                    }
-                }
-                Task::none()
-            }
-            Message::BreakglassPassphraseInput(value) => {
-                if let ModalState::BreakglassPassphrase {
-                    dataset,
-                    output_path,
-                    error,
-                    ..
-                } = &self.modal
-                {
-                    self.modal = ModalState::BreakglassPassphrase {
-                        dataset: dataset.clone(),
-                        output_path: output_path.clone(),
-                        passphrase: value,
-                        error: error.clone(),
-                    };
-                }
-                Task::none()
-            }
-            Message::BreakglassOutputInput(value) => {
-                if let ModalState::BreakglassPassphrase {
-                    dataset,
-                    passphrase,
-                    error,
-                    ..
-                } = &self.modal
-                {
-                    self.modal = ModalState::BreakglassPassphrase {
-                        dataset: dataset.clone(),
-                        output_path: value,
-                        passphrase: passphrase.clone(),
-                        error: error.clone(),
-                    };
-                }
-                Task::none()
-            }
-            Message::ExecuteBreakglass => {
-                if let ModalState::BreakglassPassphrase {
-                    dataset,
-                    output_path,
-                    passphrase,
-                    ..
-                } = &self.modal
-                {
-                    if passphrase.is_empty() {
-                        self.push_log(LogLevel::Warn, "Passphrase required".to_string());
-                        return Task::none();
-                    }
-                    let dataset_name = dataset.clone();
-                    let pass = passphrase.clone();
-                    let output = PathBuf::from(output_path);
-                    self.loading = true;
-                    self.modal = ModalState::None;
-                    return Task::perform(
-                        breakglass(self.config_path.clone(), dataset_name.clone(), pass, output),
-                        move |result| Message::BreakglassFinished {
-                            dataset: dataset_name.clone(),
-                            result,
-                        },
-                    );
-                }
-                Task::none()
-            }
-            Message::BreakglassFinished { dataset, result } => {
-                self.loading = false;
-                match result {
-                    Ok(path) => {
-                        log::warn!(
-                            "[LC4000] break-glass recovery invoked, output {}",
-                            path.display()
-                        );
-                        self.push_log(
-                            LogLevel::Security,
-                            format!("Break-glass key written to {}", path.display()),
-                        );
-                        self.modal = ModalState::BreakglassComplete {
-                            dataset,
-                            output_path: path,
-                        };
-                    }
-                    Err(err) => {
-                        self.push_log(LogLevel::Error, format!("Break-glass failed: {err}"));
-                    }
-                }
-                Task::none()
+                self.key_present = self.detect_key_presence();
+                self.executing = true;
+                self.pending_directive = Some(Directive::SelfHeal);
+                self.push_activity(ActivityLevel::Info, "Running self-heal diagnostics…");
+                Task::perform(
+                    run_directive(
+                        self.config_path.clone(),
+                        Directive::SelfHeal,
+                        self.secure_mode,
+                        self.terminal_input.clone(),
+                    ),
+                    Message::WorkflowFinished,
+                )
             }
         }
     }
 
-    fn render(&self) -> Element<'_, Message> {
+    /// Produce the full view tree for the current state.
+    fn view(&self) -> iced::Element<'_, Message> {
         let header = self.view_header();
-        let body = self.view_body();
-        let base = container(column![header, body].spacing(16).padding(20))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(cyber_container())
-            .into();
+        let main = self.view_body();
+        let footer = self.view_footer();
 
-        match self.modal_view_option() {
-            Some(modal) => stack![base, modal].into(),
-            None => base,
+        container(
+            column![header, main, footer]
+                .spacing(20)
+                .width(Length::Fill),
+        )
+        .padding(24)
+        .style(deck_background())
+        .into()
+    }
+
+    /// Check whether the expected USB key location has raw material present.
+    fn detect_key_presence(&self) -> bool {
+        LockchainConfig::load(&self.config_path)
+            .ok()
+            .map(|cfg| cfg.key_hex_path().exists())
+            .unwrap_or(false)
+    }
+
+    /// Determine if a directive should be interactable based on context.
+    fn directive_enabled(&self, directive: Directive) -> bool {
+        match directive {
+            Directive::SelfTest => self.key_present,
+            _ => true,
         }
     }
 
-    fn view_header(&self) -> Element<'_, Message> {
-        let logo = image(image::Handle::from_bytes(LOGO_BYTES.to_vec()))
-            .width(Length::Fixed(90.0))
-            .height(Length::Fixed(90.0));
+    /// Provide the application theme customisations for Iced.
+    fn theme(&self) -> Theme {
+        Theme::TokyoNight
+    }
 
-        let title = text("LockChain Control Deck")
-            .size(36)
-            .style(text_color(Color::from_rgb8(0x24, 0xd0, 0xff)));
-
-        let subtitle = text("Cybernetic ZFS key management – stay encrypted, stay neon")
+    /// Render the title bar and key state indicator.
+    fn view_header(&self) -> iced::Element<'_, Message> {
+        let title = text("Control Deck")
+            .size(32)
+            .style(text_color(iced::Color::from_rgb8(0x24, 0xd0, 0xff)));
+        let subtitle = text("Cryptographic ZFS key management — powered by LockChain")
             .size(16)
-            .style(text_color(Color::from_rgb8(0xff, 0x73, 0xff)));
+            .style(text_color(iced::Color::from_rgb8(0xff, 0x73, 0xff)));
+
+        let status_chip = container(
+            text(if self.secure_mode {
+                "SECURE"
+            } else {
+                "STANDARD"
+            })
+            .size(14)
+            .style(text_color(if self.secure_mode {
+                iced::Color::from_rgb8(0x8a, 0xff, 0x70)
+            } else {
+                iced::Color::from_rgb8(0xff, 0xc1, 0x29)
+            })),
+        )
+        .padding([6, 12])
+        .style(chip_style(self.secure_mode));
+
+        let secure_toggle = toggler(self.secure_mode)
+            .label("Secure")
+            .size(22)
+            .text_size(16)
+            .on_toggle(Message::ToggleSecure);
 
         row![
-            logo,
-            column![title, subtitle]
-                .spacing(4)
-                .align_x(Horizontal::Left),
+            column![title, subtitle].spacing(4),
             Space::with_width(Length::Fill),
-            toggler(self.strict_usb)
-                .label("Strict USB")
-                .size(22)
-                .text_alignment(Horizontal::Center)
-                .on_toggle(Message::ToggleStrict),
-            button("Refresh").on_press(Message::Refresh)
+            status_chip,
+            secure_toggle,
+            button("Refresh")
+                .padding([10, 18])
+                .style(primary_button())
+                .on_press(Message::Refresh)
         ]
         .align_y(Vertical::Center)
         .spacing(20)
         .into()
     }
 
-    fn view_body(&self) -> Element<'_, Message> {
-        let dataset_panel = self.dataset_list();
-        let log_panel = self.log_panel();
-        row![dataset_panel, log_panel].spacing(20).into()
-    }
+    /// Assemble the three-column layout containing directives, terminal, and activity log.
+    fn view_body(&self) -> iced::Element<'_, Message> {
+        let directives: iced::Element<Message> =
+            self.view_directive_panel().width(Length::Fill).into();
+        let terminal: iced::Element<Message> =
+            self.view_terminal_panel().width(Length::Fill).into();
 
-    fn dataset_list(&self) -> Element<'_, Message> {
-        let mut list = column![];
-        if self.datasets.is_empty() {
-            list = list.push(
-                text("No datasets discovered")
-                    .style(text_color(Color::from_rgb8(0xff, 0x73, 0xff))),
-            );
-        } else {
-            for entry in &self.datasets {
-                let status_text = match entry.state {
-                    KeyState::Available => {
-                        text("available").style(text_color(Color::from_rgb8(0x8a, 0xff, 0x70)))
-                    }
-                    KeyState::Unavailable => {
-                        text("locked").style(text_color(Color::from_rgb8(0xff, 0x47, 0x80)))
-                    }
-                    KeyState::Unknown(_) => {
-                        text("unknown").style(text_color(Color::from_rgb8(0xff, 0xc1, 0x29)))
-                    }
-                };
+        let left_column: iced::Element<Message> = column![directives, terminal]
+            .spacing(16)
+            .width(Length::FillPortion(5))
+            .into();
 
-                let row = row![
-                    column![
-                        text(&entry.dataset)
-                            .size(20)
-                            .style(text_color(Color::from_rgb8(0xe7, 0xff, 0xff))),
-                        text(&entry.encryption_root)
-                            .size(14)
-                            .style(text_color(Color::from_rgb8(0x67, 0xd6, 0xff))),
-                    ]
-                    .spacing(4)
-                    .width(Length::Fill),
-                    status_text,
-                    button("Unlock")
-                        .on_press(Message::Unlock(entry.dataset.clone()))
-                        .style(|theme, status| button::primary(theme, status)),
-                    button("Break-glass")
-                        .on_press(Message::ShowBreakglass(entry.dataset.clone()))
-                        .style(|theme, status| button::danger(theme, status)),
-                ]
-                .spacing(12)
-                .align_y(Vertical::Center);
+        let activity: iced::Element<Message> = self
+            .view_activity_panel()
+            .width(Length::FillPortion(7))
+            .into();
 
-                list = list.push(container(row).style(cyber_row()).padding(12));
-            }
-        }
-
-        let scroll = scrollable(list.spacing(12))
-            .width(Length::FillPortion(2))
-            .height(Length::Fill);
-        container(scroll).style(cyber_panel()).padding(16).into()
-    }
-
-    fn log_panel(&self) -> Element<'_, Message> {
-        let mut column = column![];
-        for entry in self.logs.iter().rev() {
-            let color = entry.level.color();
-            let text = text(&entry.message).style(text_color(color)).size(14);
-            column = column.push(container(text));
-        }
-        let scroll = scrollable(column.spacing(6))
-            .width(Length::Fill)
-            .height(Length::Fill);
-        let header = text("Activity Feed")
-            .size(20)
-            .style(text_color(Color::from_rgb8(0xff, 0x73, 0xff)));
-        column![header, scroll]
-            .spacing(12)
-            .width(Length::FillPortion(1))
+        row![left_column, activity]
+            .spacing(24)
+            .align_y(Vertical::Top)
             .into()
     }
 
-    fn modal_view_option(&self) -> Option<Element<'_, Message>> {
-        match &self.modal {
-            ModalState::None => None,
-            ModalState::Passphrase {
-                dataset,
-                value,
-                error,
-            } => {
-                let title = text(format!("Passphrase required for {dataset}")).size(22);
-                let input = text_input("enter passphrase", value)
-                    .secure(true)
-                    .on_input(Message::PassphraseInput)
-                    .on_submit(Message::SubmitPassphrase);
-                let mut column = column![title, input];
-                if let Some(err) = error {
-                    column = column
-                        .push(text(err).style(text_color(Color::from_rgb8(0xff, 0x47, 0x80))));
-                }
-                column = column.push(
-                    row![
-                        button("Cancel").on_press(Message::CancelModal),
-                        button("Unlock").on_press(Message::SubmitPassphrase)
-                    ]
-                    .spacing(12),
-                );
-                Some(modal_container(column))
-            }
-            ModalState::BreakglassConfirmName { dataset, input } => {
-                let column = column![
-                    text("Break-glass recovery :: confirm dataset").size(22),
-                    text("Type the dataset name exactly to continue:"),
-                    text_input(dataset, input).on_input(Message::BreakglassNameInput),
-                    row![
-                        button("Cancel").on_press(Message::CancelModal),
-                        button("Continue").on_press(Message::ConfirmBreakglassName)
-                    ]
-                    .spacing(12),
+    /// Build the directive selection list with cards and toggles.
+    fn view_directive_panel(&self) -> iced::widget::Container<'_, Message> {
+        let mut list = column![];
+        for entry in DIRECTIVES {
+            let active = entry.directive == self.active_directive;
+            let enabled = self.directive_enabled(entry.directive);
+            let mut button = button(
+                column![
+                    text(entry.title).size(20).style(text_color(if enabled {
+                        iced::Color::from_rgb8(0xe7, 0xff, 0xff)
+                    } else {
+                        iced::Color::from_rgb8(0x55, 0x66, 0x88)
+                    })),
+                    text(entry.subtitle).size(14).style(text_color(if enabled {
+                        iced::Color::from_rgb8(0x67, 0xd6, 0xff)
+                    } else {
+                        iced::Color::from_rgb8(0x44, 0x55, 0x8a)
+                    }))
                 ]
-                .spacing(12);
-                Some(modal_container(column))
+                .spacing(4),
+            )
+            .width(Length::Fill)
+            .padding([12, 18])
+            .style(directive_style(active, enabled));
+
+            if enabled {
+                button = button.on_press(Message::DirectiveSelected(entry.directive));
             }
-            ModalState::BreakglassConfirmPhrase { dataset, input } => {
-                let column = column![
-                    text(format!(
-                        "Dataset {dataset} confirmed. Type BREAKGLASS to proceed."
-                    )),
-                    text_input("BREAKGLASS", input).on_input(Message::BreakglassPhraseInput),
-                    row![
-                        button("Cancel").on_press(Message::CancelModal),
-                        button("Continue").on_press(Message::ConfirmBreakglassPhrase)
-                    ]
-                    .spacing(12),
+            list = list.push(button);
+        }
+
+        container(
+            column![
+                text("Select Module Directive")
+                    .size(18)
+                    .style(text_color(iced::Color::from_rgb8(0xff, 0x51, 0xff))),
+                list.spacing(10)
+            ]
+            .spacing(16),
+        )
+        .padding(20)
+        .style(panel_style())
+    }
+
+    /// Show terminal-like inputs, status chip, and action buttons for the active directive.
+    fn view_terminal_panel(&self) -> iced::widget::Container<'_, Message> {
+        let input = text_input("Enter command or parameters…", &self.terminal_input)
+            .on_input(Message::TerminalChanged)
+            .size(18)
+            .padding(12)
+            .style(text_input_style());
+
+        let execute_enabled = self.directive_enabled(self.active_directive);
+
+        let mut execute = button(
+            text("Execute")
+                .size(18)
+                .style(text_color(iced::Color::from_rgb8(0x05, 0x08, 0x1f))),
+        )
+        .width(Length::Fill)
+        .padding([12, 18])
+        .style(execute_button(execute_enabled));
+
+        if execute_enabled {
+            execute = execute.on_press(Message::Execute);
+        }
+
+        let status = column![
+            text(format!(
+                "System Status: {}",
+                self.status_line.to_uppercase()
+            ))
+            .size(14)
+            .style(text_color(iced::Color::from_rgb8(0x8a, 0xff, 0x70))),
+            text(format!(
+                "Active Module: {}",
+                directive_title(self.active_directive)
+            ))
+            .size(14)
+            .style(text_color(iced::Color::from_rgb8(0x67, 0xd6, 0xff)))
+        ]
+        .spacing(4);
+
+        let notes: iced::Element<'_, Message> =
+            if matches!(self.active_directive, Directive::SelfTest) && !execute_enabled {
+                column![
+                    text("Self-test unavailable until a LockChain key is forged or inserted.")
+                        .size(14)
+                        .style(text_color(iced::Color::from_rgb8(0xff, 0xc1, 0x29)))
                 ]
-                .spacing(12);
-                Some(modal_container(column))
-            }
-            ModalState::BreakglassPassphrase {
-                dataset,
-                output_path,
-                passphrase,
-                error,
-            } => {
-                let mut column = column![
-                    text(format!("Emergency key derivation for {dataset}")),
-                    text("Specify output path and passphrase."),
-                    text_input("/var/lib/lockchain/<file>.key", output_path)
-                        .on_input(Message::BreakglassOutputInput),
-                    text_input("passphrase", passphrase)
-                        .secure(true)
-                        .on_input(Message::BreakglassPassphraseInput),
+                .spacing(4)
+                .into()
+            } else {
+                column![].into()
+            };
+
+        container(
+            column![
+                text("> User Input Terminal")
+                    .size(18)
+                    .style(text_color(iced::Color::from_rgb8(0xff, 0x51, 0xff))),
+                column![
+                    text("Command Input:")
+                        .size(14)
+                        .style(text_color(iced::Color::from_rgb8(0x8a, 0xff, 0x70))),
+                    input,
+                    execute,
+                    status,
+                    notes,
                     row![
-                        button("Cancel").on_press(Message::CancelModal),
-                        button("Derive key").on_press(Message::ExecuteBreakglass)
+                        button("Help")
+                            .padding([10, 16])
+                            .style(help_button())
+                            .on_press(Message::HelpPressed),
+                        button("Killswitch")
+                            .padding([10, 16])
+                            .style(killswitch_button())
+                            .on_press(Message::KillSwitchPressed)
                     ]
-                    .spacing(12),
-                ];
-                if let Some(err) = error {
-                    column = column
-                        .push(text(err).style(text_color(Color::from_rgb8(0xff, 0x47, 0x80))));
-                }
-                Some(modal_container(column.spacing(12)))
-            }
-            ModalState::BreakglassComplete {
-                dataset,
-                output_path,
-            } => {
-                let column = column![
-                    text("Break-glass complete").size(22),
-                    text(format!("Dataset unlocked: {dataset}")),
-                    text(format!("Key written to {}", output_path.display())),
-                    text("Remember to securely delete this file once the incident concludes."),
-                    button("Close").on_press(Message::CancelModal),
+                    .spacing(12)
                 ]
-                .spacing(12);
-                Some(modal_container(column))
-            }
+                .spacing(12)
+            ]
+            .spacing(16),
+        )
+        .padding(20)
+        .style(panel_style())
+    }
+
+    /// Display the scrolling log of workflow events.
+    fn view_activity_panel(&self) -> iced::widget::Container<'_, Message> {
+        let mut column = column![];
+        for item in self.activity.iter().rev() {
+            let line = column![
+                row![
+                    text(format!("[{}]", item.timestamp))
+                        .size(14)
+                        .style(text_color(iced::Color::from_rgb8(0x67, 0xd6, 0xff))),
+                    text(item.level.label())
+                        .size(14)
+                        .style(text_color(item.level.color()))
+                ]
+                .spacing(12),
+                text(&item.message)
+                    .size(14)
+                    .style(text_color(iced::Color::from_rgb8(0xe7, 0xff, 0xff)))
+            ]
+            .spacing(6);
+            column = column.push(container(line).padding([8, 12]).style(activity_entry()));
+        }
+
+        let scroll = scrollable(column.spacing(12)).height(Length::Fill);
+
+        container(
+            column![
+                text("Runtime Activity Feed")
+                    .size(18)
+                    .style(text_color(iced::Color::from_rgb8(0xff, 0x51, 0xff))),
+                scroll
+            ]
+            .spacing(16),
+        )
+        .padding(20)
+        .style(panel_style())
+    }
+
+    /// Render the footer with a simple status line and dataset summary.
+    fn view_footer(&self) -> iced::Element<'_, Message> {
+        row![
+            text(format!("Total Events: {}", self.total_events))
+                .size(14)
+                .style(text_color(iced::Color::from_rgb8(0x67, 0xd6, 0xff))),
+            Space::with_width(Length::Fill),
+            text(format!("Status: {}", self.status_line.to_uppercase()))
+                .size(14)
+                .style(text_color(iced::Color::from_rgb8(0x8a, 0xff, 0x70)))
+        ]
+        .align_y(Vertical::Center)
+        .into()
+    }
+
+    /// Convert workflow events into activity items and append them to the log.
+    fn ingest_events(&mut self, events: Vec<WorkflowEvent>) {
+        for event in events {
+            self.push_activity(ActivityLevel::from(event.level), event.message);
         }
     }
 
-    fn push_log(&mut self, level: LogLevel, msg: impl Into<String>) {
-        self.logs.push(LogEntry {
+    /// Push a single activity entry and prune the backlog when needed.
+    fn push_activity(&mut self, level: ActivityLevel, message: impl Into<String>) {
+        let ts = Local::now().format("%H:%M:%S").to_string();
+        self.activity.push(ActivityItem {
+            timestamp: ts,
             level,
-            message: msg.into(),
+            message: message.into(),
         });
-        if self.logs.len() > 200 {
-            self.logs.drain(0..self.logs.len() - 200);
+        self.total_events += 1;
+        if self.activity.len() > 400 {
+            let excess = self.activity.len() - 400;
+            self.activity.drain(0..excess);
         }
     }
 }
 
-fn modal_container(content: widget::Column<'_, Message>) -> Element<'_, Message> {
-    container(
-        container(content.padding(20).spacing(12))
-            .width(Length::Fixed(420.0))
-            .style(modal_panel()),
+/// Human-friendly label for directives when status lines need text.
+fn directive_title(directive: Directive) -> &'static str {
+    match directive {
+        Directive::NewKey => "New Key",
+        Directive::NewKeySafe => "New Key (Safe mode)",
+        Directive::SelfTest => "Self-test",
+        Directive::RecoverKey => "Recover Key",
+        Directive::SelfHeal => "Self-heal Issues",
+        Directive::Doctor => "Doctor",
+    }
+}
+
+/// Contextual help string shown in the terminal panel.
+fn help_text(directive: Directive) -> &'static str {
+    match directive {
+        Directive::NewKey => "Forge a new 32-byte USB key. Provide dataset=<name> to target a specific encryption root.",
+        Directive::NewKeySafe => "Safe forge prompts for review. Supply dataset=<name> as needed.",
+        Directive::SelfTest => "Provision a scratch encrypted pool, unlock it with the current key, then tear it down. Supports dataset=<name>, device=/dev/sdX, mount=/run/lockchain, filename=lockchain.key, rebuild=false, passphrase=<secret>.",
+        Directive::RecoverKey => "Derive fallback key using passphrase. Provide dataset=<name> passphrase=<secret> [output=/path].",
+        Directive::SelfHeal => "Runs diagnostics against key file, checksum, and dataset keystatus.",
+        Directive::Doctor => "Runs self-heal plus systemd/journal/initramfs audits. Provide no args; review warnings for remediation guidance.",
+    }
+}
+
+/// Parse key=value arguments from the terminal input field.
+fn parse_kv(input: &str) -> (HashMap<String, String>, Vec<String>) {
+    let mut map = HashMap::new();
+    let mut free = Vec::new();
+
+    for token in input.split_whitespace() {
+        if let Some((key, value)) = token.split_once('=') {
+            map.insert(key.to_lowercase(), value.to_string());
+        } else if let Some((key, value)) = token.split_once(':') {
+            map.insert(key.to_lowercase(), value.to_string());
+        } else {
+            free.push(token.to_string());
+        }
+    }
+
+    (map, free)
+}
+
+/// Accept several truthy strings when toggling options via text.
+fn parse_bool(input: &str) -> bool {
+    matches!(
+        input.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
     )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .into()
 }
 
-fn cyber_panel() -> impl Fn(&Theme) -> container::Style + Copy {
-    |_| {
-        container::Style::default()
-            .background(Background::Color(Color::from_rgba(0.05, 0.08, 0.2, 0.6)))
-            .border(border::Border {
-                color: Color::from_rgb8(0x24, 0xd0, 0xff),
-                width: 1.0,
-                radius: border::Radius::new(12.0),
-            })
-    }
-}
-
-fn cyber_row() -> impl Fn(&Theme) -> container::Style + Copy {
-    |_| {
-        container::Style::default()
-            .background(Background::Color(Color::from_rgba(0.07, 0.1, 0.24, 0.8)))
-            .border(border::Border {
-                color: Color::from_rgb8(0xff, 0x73, 0xff),
-                width: 1.0,
-                radius: border::Radius::new(8.0),
-            })
-    }
-}
-
-fn cyber_container() -> impl Fn(&Theme) -> container::Style + Copy {
-    |_| {
-        container::Style::default()
-            .background(Background::Color(Color::from_rgb8(0x02, 0x05, 0x18)))
-    }
-}
-
-fn modal_panel() -> impl Fn(&Theme) -> container::Style + Copy {
-    |_| {
-        container::Style::default()
-            .background(Background::Color(Color::from_rgba(0.03, 0.06, 0.16, 0.95)))
-            .border(border::Border {
-                color: Color::from_rgb8(0xff, 0x47, 0x80),
-                width: 1.5,
-                radius: border::Radius::new(12.0),
-            })
-    }
-}
-
-fn text_color(color: Color) -> impl Fn(&Theme) -> text::Style + Copy {
-    move |_| text::Style { color: Some(color) }
-}
-
-async fn load_status(config_path: PathBuf) -> Result<Vec<DatasetKeyDescriptor>, String> {
-    let service = build_service(&config_path).map_err(|e| e.to_string())?;
-    service.list_keys().map_err(|e| e.to_string())
-}
-
-async fn unlock_dataset(
+/// Kick off the selected workflow and return a `Message` when finished.
+async fn run_directive(
     config_path: PathBuf,
-    dataset: String,
-    strict_usb: bool,
-    passphrase: Option<String>,
-) -> Result<Vec<String>, String> {
-    let service = build_service(&config_path).map_err(|e| e.to_string())?;
-    let mut options = UnlockOptions::default();
-    options.strict_usb = strict_usb;
-    if let Some(pass) = passphrase {
-        options.fallback_passphrase = Some(pass);
+    directive: Directive,
+    secure_mode: bool,
+    raw_input: String,
+) -> Result<WorkflowReport, String> {
+    let mut config = LockchainConfig::load(&config_path).map_err(|e| e.to_string())?;
+    let provider = SystemZfsProvider::from_config(&config).map_err(|err| format!("{err}"))?;
+
+    let (kv, free) = parse_kv(&raw_input);
+
+    match directive {
+        Directive::NewKey | Directive::NewKeySafe => {
+            let dataset = resolve_dataset(&config, &kv, &free)?;
+            let mode = if matches!(directive, Directive::NewKeySafe) {
+                ForgeMode::Safe
+            } else {
+                ForgeMode::Standard
+            };
+
+            let mut options = ProvisionOptions::default();
+            if let Some(device) = kv.get("device").map(|s| s.to_string()) {
+                options.usb_device = Some(device);
+            }
+            if let Some(mount) = kv.get("mount").map(|s| PathBuf::from(s)) {
+                options.mountpoint = Some(mount);
+            }
+            if let Some(file) = kv
+                .get("filename")
+                .or_else(|| kv.get("file"))
+                .map(|s| s.to_string())
+            {
+                options.key_filename = Some(file);
+            }
+            if let Some(pass) = kv.get("passphrase").map(|s| s.to_string()) {
+                options.passphrase = Some(pass);
+            }
+            if let Some(force) = kv.get("force").map(|v| parse_bool(v)) {
+                options.force_wipe = force;
+            } else if matches!(mode, ForgeMode::Standard) {
+                options.force_wipe = true;
+            }
+            if let Some(rebuild) = kv.get("rebuild").map(|v| parse_bool(v)) {
+                options.rebuild_initramfs = rebuild;
+            }
+
+            workflow::forge_key(&mut config, &provider, &dataset, mode, options)
+                .map_err(|e| e.to_string())
+        }
+        Directive::SelfTest => {
+            let dataset = resolve_dataset(&config, &kv, &free)?;
+            workflow::self_test(&config, provider, &dataset, secure_mode).map_err(|e| e.to_string())
+        }
+        Directive::RecoverKey => {
+            let dataset = resolve_dataset(&config, &kv, &free)?;
+            let passphrase = kv
+                .get("passphrase")
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    if !free.is_empty() {
+                        Some(free.join(" "))
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| "passphrase=<secret> required for recovery".to_string())?;
+
+            let output = kv
+                .get("output")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_recovery_path(&dataset));
+
+            workflow::recover_key(&config, provider, &dataset, passphrase.as_bytes(), &output)
+                .map_err(|e| e.to_string())
+        }
+        Directive::SelfHeal => workflow::self_heal(&config, provider).map_err(|e| e.to_string()),
+        Directive::Doctor => workflow::doctor(&config, provider).map_err(|e| e.to_string()),
     }
-    service
-        .unlock_with_retry(&dataset, options)
-        .map(|r| r.unlocked)
-        .map_err(|e| e.to_string())
 }
 
-async fn breakglass(
-    config_path: PathBuf,
-    _dataset: String,
-    passphrase: String,
-    output: PathBuf,
-) -> Result<PathBuf, String> {
-    let service = build_service(&config_path).map_err(|e| e.to_string())?;
-    let key = service
-        .derive_fallback_key(passphrase.as_bytes())
-        .map_err(|e| e.to_string())?;
-    lockchain_core::keyfile::write_raw_key_file(&output, &key)
-        .map_err(|e| LockchainError::from(e).to_string())?;
-    Ok(output)
+/// Reuse CLI dataset resolution semantics inside the UI.
+fn resolve_dataset(
+    config: &LockchainConfig,
+    kv: &HashMap<String, String>,
+    free: &[String],
+) -> Result<String, String> {
+    if let Some(ds) = kv.get("dataset") {
+        return Ok(ds.clone());
+    }
+    if let Some(first) = free.first() {
+        if first.contains('/') {
+            return Ok(first.clone());
+        }
+    }
+    config
+        .policy
+        .datasets
+        .first()
+        .cloned()
+        .ok_or_else(|| "No dataset configured; add one to policy.datasets".to_string())
 }
 
-fn build_service(
-    config_path: &Path,
-) -> Result<LockchainService<SystemZfsProvider>, LockchainError> {
-    let config = Arc::new(LockchainConfig::load(config_path)?);
-    let provider = SystemZfsProvider::from_config(&config)?;
-    Ok(LockchainService::new(config, provider))
+/// Derive a sensible filename for fallback key recovery output.
+fn default_recovery_path(dataset: &str) -> PathBuf {
+    let sanitized = dataset.replace('/', "-");
+    let timestamp = Local::now().format("%Y%m%d%H%M%S");
+    Path::new("/var/lib/lockchain").join(format!("{}_{}.key", sanitized, timestamp))
+}
+
+/// Base background styling for the entire control deck.
+fn deck_background() -> impl Fn(&Theme) -> iced::widget::container::Style + Copy {
+    |_| iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(
+            0x05, 0x08, 0x1f,
+        ))),
+        ..Default::default()
+    }
+}
+
+/// Shared styling for the directive/terminal/activity panels.
+fn panel_style() -> impl Fn(&Theme) -> iced::widget::container::Style + Copy {
+    |_| iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgba(
+            0.05, 0.08, 0.2, 0.7,
+        ))),
+        border: Border {
+            radius: Radius::from(12.0),
+            width: 1.5,
+            color: iced::Color::from_rgb8(0x24, 0xd0, 0xff),
+        },
+        ..Default::default()
+    }
+}
+
+/// Container styling for individual activity log entries.
+fn activity_entry() -> impl Fn(&Theme) -> iced::widget::container::Style + Copy {
+    |_| iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgba(
+            0.03, 0.05, 0.18, 0.8,
+        ))),
+        border: Border {
+            radius: Radius::from(8.0),
+            width: 1.0,
+            color: iced::Color::from_rgb8(0xff, 0x73, 0xff),
+        },
+        ..Default::default()
+    }
+}
+
+/// Styling for directive cards, adapting to focus and disabled states.
+fn directive_style(
+    active: bool,
+    enabled: bool,
+) -> impl Fn(&Theme, ButtonStatus) -> ButtonStyle + Copy {
+    move |_theme, _status| {
+        if !enabled {
+            ButtonStyle {
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(
+                    0x12, 0x15, 0x29,
+                ))),
+                text_color: iced::Color::from_rgb8(0x55, 0x66, 0x88),
+                border: Border {
+                    color: iced::Color::from_rgb8(0x25, 0x28, 0x40),
+                    width: 1.0,
+                    radius: Radius::from(10.0),
+                },
+                ..ButtonStyle::default()
+            }
+        } else if active {
+            ButtonStyle {
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(
+                    0x1a, 0x2b, 0x66,
+                ))),
+                text_color: iced::Color::from_rgb8(0xe7, 0xff, 0xff),
+                border: Border {
+                    color: iced::Color::from_rgb8(0xff, 0x73, 0xff),
+                    width: 2.0,
+                    radius: Radius::from(10.0),
+                },
+                ..ButtonStyle::default()
+            }
+        } else {
+            ButtonStyle {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.07, 0.10, 0.24, 0.8,
+                ))),
+                text_color: iced::Color::from_rgb8(0xe7, 0xff, 0xff),
+                border: Border {
+                    color: iced::Color::from_rgb8(0x24, 0xd0, 0xff),
+                    width: 1.0,
+                    radius: Radius::from(10.0),
+                },
+                ..ButtonStyle::default()
+            }
+        }
+    }
+}
+
+/// Style sheet for the main Execute button depending on availability.
+fn execute_button(enabled: bool) -> impl Fn(&Theme, ButtonStatus) -> ButtonStyle + Copy {
+    move |_theme, status| {
+        if !enabled {
+            ButtonStyle {
+                background: Some(iced::Background::Color(iced::Color::from_rgb8(
+                    0x12, 0x15, 0x29,
+                ))),
+                text_color: iced::Color::from_rgb8(0x55, 0x66, 0x88),
+                border: Border {
+                    color: iced::Color::from_rgb8(0x25, 0x28, 0x40),
+                    width: 1.0,
+                    radius: Radius::from(8.0),
+                },
+                ..ButtonStyle::default()
+            }
+        } else {
+            let base = iced::Color::from_rgb8(0x24, 0xd0, 0xff);
+            let background = match status {
+                ButtonStatus::Pressed => iced::Color::from_rgb8(0x1a, 0xa0, 0xc8),
+                _ => base,
+            };
+            ButtonStyle {
+                background: Some(iced::Background::Color(background)),
+                text_color: iced::Color::from_rgb8(0x05, 0x08, 0x1f),
+                border: Border {
+                    color: iced::Color::from_rgb8(0x24, 0xd0, 0xff),
+                    width: 1.0,
+                    radius: Radius::from(8.0),
+                },
+                ..ButtonStyle::default()
+            }
+        }
+    }
+}
+
+/// Reusable primary button style for positive actions.
+fn primary_button() -> impl Fn(&Theme, ButtonStatus) -> ButtonStyle + Copy {
+    move |_theme, status| {
+        let base = iced::Color::from_rgb8(0x24, 0xd0, 0xff);
+        let background = match status {
+            ButtonStatus::Pressed => iced::Color::from_rgb8(0x1a, 0xa0, 0xc8),
+            _ => base,
+        };
+        ButtonStyle {
+            background: Some(iced::Background::Color(background)),
+            text_color: iced::Color::from_rgb8(0x05, 0x08, 0x1f),
+            border: Border {
+                color: iced::Color::from_rgb8(0x24, 0xd0, 0xff),
+                width: 1.0,
+                radius: Radius::from(8.0),
+            },
+            ..ButtonStyle::default()
+        }
+    }
+}
+
+/// Button styling for the inline help toggle.
+fn help_button() -> impl Fn(&Theme, ButtonStatus) -> ButtonStyle + Copy {
+    move |_theme, _status| ButtonStyle {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(
+            0x12, 0x66, 0x4f,
+        ))),
+        text_color: iced::Color::from_rgb8(0xe7, 0xff, 0xff),
+        border: Border {
+            color: iced::Color::from_rgb8(0x12, 0x66, 0x4f),
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
+        ..ButtonStyle::default()
+    }
+}
+
+/// Styling for the kill-switch button that stands out from primary actions.
+fn killswitch_button() -> impl Fn(&Theme, ButtonStatus) -> ButtonStyle + Copy {
+    move |_theme, _status| ButtonStyle {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(
+            0x70, 0x13, 0x39,
+        ))),
+        text_color: iced::Color::from_rgb8(0xff, 0x73, 0xff),
+        border: Border {
+            color: iced::Color::from_rgb8(0x70, 0x13, 0x39),
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
+        ..ButtonStyle::default()
+    }
+}
+
+/// The pill-style indicator that shows whether secure mode is enabled.
+fn chip_style(secure: bool) -> impl Fn(&Theme) -> iced::widget::container::Style + Copy {
+    move |_| iced::widget::container::Style {
+        background: Some(iced::Background::Color(if secure {
+            iced::Color::from_rgba(0.08, 0.20, 0.14, 0.9)
+        } else {
+            iced::Color::from_rgba(0.20, 0.12, 0.24, 0.9)
+        })),
+        border: Border {
+            radius: Radius::from(999.0),
+            width: 1.0,
+            color: if secure {
+                iced::Color::from_rgb8(0x8a, 0xff, 0x70)
+            } else {
+                iced::Color::from_rgb8(0xff, 0xc1, 0x29)
+            },
+        },
+        ..Default::default()
+    }
+}
+/// Text input styling that keeps the neon look while typing.
+fn text_input_style(
+) -> impl Fn(&Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style + Copy {
+    move |_theme, status| {
+        let border = match status {
+            iced::widget::text_input::Status::Focused => iced::Color::from_rgb8(0x24, 0xd0, 0xff),
+            _ => iced::Color::from_rgb8(0x3a, 0x45, 0x7d),
+        };
+        iced::widget::text_input::Style {
+            background: iced::Background::Color(iced::Color::from_rgba(0.04, 0.07, 0.20, 0.9)),
+            border: Border {
+                radius: Radius::from(8.0),
+                width: 1.0,
+                color: border,
+            },
+            icon: iced::Color::WHITE,
+            placeholder: iced::Color::from_rgb8(0x67, 0xd6, 0xff),
+            value: iced::Color::from_rgb8(0xe7, 0xff, 0xff),
+            selection: iced::Color::from_rgb8(0x24, 0xd0, 0xff),
+        }
+    }
+}
+
+/// Helper to override text color based on the theme palette.
+fn text_color(color: iced::Color) -> impl Fn(&Theme) -> iced::widget::text::Style + Copy {
+    move |_| iced::widget::text::Style {
+        color: Some(color),
+        ..Default::default()
+    }
 }

@@ -1,3 +1,7 @@
+//! Handles spawning the real `zfs` and `zpool` binaries with timeouts and
+//! friendly error handling. This is the glue between Lockchain and the host
+//! shell.
+
 use lockchain_core::error::{LockchainError, LockchainResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -5,13 +9,15 @@ use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+/// Wraps a concrete binary path and timeout used to run ZFS CLI commands.
 pub struct CommandRunner {
     path: PathBuf,
     timeout: Duration,
 }
 
 #[derive(Debug)]
+/// Collects stdout, stderr, and exit status from a finished command.
 pub struct Output {
     pub stdout: String,
     pub stderr: String,
@@ -19,14 +25,17 @@ pub struct Output {
 }
 
 impl CommandRunner {
+    /// Build a new runner targeting the supplied binary and timeout.
     pub fn new(path: PathBuf, timeout: Duration) -> Self {
         Self { path, timeout }
     }
 
+    /// Return the binary path this runner will execute.
     pub fn binary(&self) -> &std::path::Path {
         &self.path
     }
 
+    /// Execute the binary with arguments, optional stdin payload, and capture the result.
     pub fn run(&self, args: &[&str], input: Option<&[u8]>) -> LockchainResult<Output> {
         let mut command = Command::new(&self.path);
         command.args(args);
@@ -51,6 +60,7 @@ impl CommandRunner {
         self.wait_with_timeout(child, stdout_pipe, stderr_pipe)
     }
 
+    /// Wait for the child process until it finishes or exceeds the configured timeout.
     fn wait_with_timeout(
         &self,
         mut child: Child,
@@ -96,6 +106,7 @@ impl CommandRunner {
         })
     }
 
+    /// Spin up a helper thread to drain a pipe and return the collected text.
     fn spawn_output_reader<R>(pipe: Option<R>) -> thread::JoinHandle<LockchainResult<String>>
     where
         R: Read + Send + 'static,

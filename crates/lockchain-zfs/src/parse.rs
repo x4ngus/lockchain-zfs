@@ -1,5 +1,7 @@
-/// Parse tabular CLI output generated via `-H -o name,value` style listings into
-/// name/value pairs.
+//! Helpers for turning `zfs` and `zpool` CLI output into data structures the
+//! rest of the crate can reason about.
+
+/// Turn `-H -o name,value` style command output into name/value pairs.
 pub(crate) fn parse_tabular_pairs(output: &str) -> Vec<(String, String)> {
     output
         .lines()
@@ -7,6 +9,7 @@ pub(crate) fn parse_tabular_pairs(output: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Normalize a single line from the CLI into a `(name, value)` pair if possible.
 fn parse_pair_line(line: &str) -> Option<(String, String)> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -43,7 +46,7 @@ fn parse_pair_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.to_string()))
 }
 
-/// Extract the pool name from a dataset identifier (portion before `/`).
+/// Peel off the pool name prefix from a dataset identifier.
 pub(crate) fn pool_from_dataset(dataset: &str) -> Option<&str> {
     let candidate = dataset.split('/').next()?;
     if candidate.is_empty() {

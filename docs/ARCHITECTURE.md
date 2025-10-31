@@ -1,86 +1,89 @@
-# Architecture Overview
+# Architecture Brief
 
-This document outlines the service boundaries inside the LockChain workspace,
-with a focus on the ZFS provider contract shared across the crates and the way
-long-running services compose with the USB watcher.
+This document explains LockChain ZFS major components and highlights the system dependencies they rely on.
 
-## Core Concepts
+---
 
-- **Configuration (`LockchainConfig`)**: Loaded from TOML or YAML, the config
-  describes the managed datasets, ZFS binary location, USB key path, and
-  fallback parameters. It is the canonical source of runtime settings.
-- **Service Layer (`LockchainService`)**: Implements domain operations such as
-  `unlock`, `status`, and `list_keys`. It consumes any implementation of the
-  provider contract and exposes a testable, dependency-injected API to the CLI,
-  daemon, or UI surfaces.
-- **Provider Interface (`ZfsProvider`)**: Abstracts the mechanics of invoking
-  ZFS. Each crate can supply its own implementation (system commands, RPC, or
-  mocks) while respecting the same behaviour contract.
+## Guiding Principles
 
-## Provider Contract
+1. **Policy First** — Everything flows from `LockchainConfig`. We load policy once, keep it immutable, and hand it to every surface (CLI, daemon, UI) so the story stays consistent.  
+2. **Pluggable Transport** — The `ZfsProvider` trait defines the only contract the service layer needs. Today we shell out to `zfs`/`zpool`; tomorrow we can point at an RPC bridge without rewriting business logic.  
+3. **Workflows Everywhere** — Provisioning, unlocking, self-test, and doctor diagnostics all call the same core workflows. Each surface is a different lens on the same machinery.
 
-The `ZfsProvider` trait (defined in `lockchain-core`) encapsulates the minimal
-set of operations the service layer requires:
+## Component Map
+
+| Layer | Responsibility | Architectural note |
+| --- | --- | --- |
+| **lockchain-core** | Policy model, workflow orchestration, error taxonomy | Pure Rust, no direct system calls, designed for deterministic tests. |
+| **lockchain-zfs** | `SystemZfsProvider` implementation | Normalises shell interaction with `zfs`/`zpool`, maps exit codes, parses stdout. |
+| **lockchain-daemon** | Long-running supervisor | Applies retry policy, surfaces health, and centralises workflow execution. |
+| **lockchain-key-usb** | udev listener & key normaliser | Enforces USB presence, rewrites legacy keys, mirrors material to secure paths. |
+| **lockchain-cli / lockchain-ui** | Operator consoles | Provide automation hooks and visual oversight via the same workflow primitives. |
+
+## Data Flow Narrative
+
+1. **Policy Load** — Every binary starts by loading `LockchainConfig` (TOML/YAML). Overrides via env vars keep deployments flexible.  
+2. **Workflow Selection** — Unlock, forge, recover, self-test, or doctor? Each directive funnels into `lockchain-core::workflow`.  
+3. **Provider Boundary** — Workflows depend on `ZfsProvider` for four verbs: find encryption roots, list locked descendants, load keys, and snapshot status.  
+4. **Observation & Feedback** — Structured events (`WorkflowReport`) feed the UI activity log, CLI output, and daemon logs. Each carries a severity level and message ready for SOC tooling.
+
+### The ZFS Provider Contract
 
 ```rust
 pub trait ZfsProvider {
-    /// Resolve the encryption root responsible for `dataset`.
     fn encryption_root(&self, dataset: &str) -> LockchainResult<String>;
-
-    /// Return datasets under `root` (including the root itself) that still
-    /// report a sealed keystatus.
     fn locked_descendants(&self, root: &str) -> LockchainResult<Vec<String>>;
-
-    /// Attempt to load a key for `root` and any descendants that share it.
-    /// Returns the datasets confirmed to have accepted the key, in order.
     fn load_key_tree(&self, root: &str, key: &[u8]) -> LockchainResult<Vec<String>>;
-
-    /// Describe the keystatus for each dataset. Implementations should preserve
-    /// the input order in the returned snapshot.
     fn describe_datasets(&self, datasets: &[String]) -> LockchainResult<KeyStatusSnapshot>;
 }
 ```
 
-### Behaviour Guidelines
+Interpretation: the service layer asks ZFS four deterministic questions; providers respond consistently and capture enough context for audit.
 
-- **Deterministic Ordering**: Methods that return dataset lists are expected to
-  preserve deterministic ordering. The core service relies on this to present
-  predictable outputs in the CLI, and mock tests assert sorted results.
-- **Error Semantics**: Use descriptive `LockchainError::Provider` messages when
-  an underlying command fails. Callers differentiate between configuration
-  issues (e.g., `DatasetNotConfigured`) and runtime failures.
-- **Separation of Concerns**: Provider implementations must not read user
-  configuration directly; pass in the necessary data via the service layer.
-  This keeps tests simple and ensures alternate implementations (for example,
-  a future ZFS daemon) stay drop-in compatible.
+### Behavioural Guarantees
 
-## Implementations
+- Deterministic ordering for dataset lists — keeps UI tables stable and tests tight.  
+- Explicit error mapping — provider failures become `LockchainError::Provider`, config mistakes surface as validation errors.  
+- Zero direct config reads inside providers — keeps the contract pure and drop-in replacements painless.
 
-| Implementation | Crate | Notes |
+## Long-running Services
+
+### lockchain-daemon
+
+- Spins up a `LockchainService<SystemZfsProvider>` and applies the `retry` policy for every dataset.  
+- Exposes `GET /` on `LOCKCHAIN_HEALTH_ADDR` returning `OK` or `DEGRADED` with human-readable reasons.  
+- Emits `[LC2xxx]` codes on successful unlocks, `[LC5xxx]` when providers misbehave, perfect for alert routing.
+
+### lockchain-key-usb
+
+- Watches udev for USB partitions, filters by label/UUID, mounts read-only when possible.  
+- Reads key material, normalises hex → raw, writes to the configured path with `0400` permissions, and updates the checksum if policy expects it.  
+- Clears the destination if checks fail to avoid stale or poisoned keys.
+
+The daemon and watcher share config and logging, so you get one cohesive story in the logs.
+
+## Workflow Spotlight
+
+| Workflow | What it does | Architectural impact |
 | --- | --- | --- |
-| `SystemZfsProvider` | `lockchain-zfs` | Shells out to the native `zfs`/`zpool` CLI with timeout controls and exit-code mapping. |
-| `MockProvider` | `lockchain-core` tests | In-memory implementation validating service behaviour. |
-| `DaemonService` | `lockchain-daemon` | Long-running process orchestrating USB events, scheduled unlocks, and health reporting. |
+| **Forge** (`workflow::forge_key`) | Prepares the USB device, writes raw key material, refreshes initramfs assets, updates policy. | Establishes the baseline state; ensures downstream tooling sees fully hardened media. |
+| **Self-test** (`workflow::self_test`) | Creates an ephemeral pool, validates unlock, confirms keystatus, tears everything down. | Proof that current key material remains functional without touching production pools. |
+| **Doctor** (`workflow::doctor`) | Runs self-heal, inspects journald, reviews systemd units, verifies dracut/initramfs tooling, reapplies system integration defaults. | Provides readiness data you can hand to operations or compliance. |
+| **Recover** (`workflow::recover_key`) | Derives fallback key material, writes it with `0400`, emits security events. | Binds emergency recovery to policy and audit signals. |
 
-When adding new providers, ensure they satisfy the contract above and write
-integration or unit tests that demonstrate compliance. The unit tests in
-`lockchain-core` serve as a compatibility suite; they will fail early if the
-contract is broken.
+## Extension Points
 
-## Services Model
+- **Alternate Providers** — Implement `ZfsProvider` for a remote unlock API or pool-in-container testing; the CLI and UI won’t notice.  
+- **New Workflows** — Compose existing events and the retry machinery to add features (e.g., automated dataset audits).  
+- **Telemetry Hooks** — All workflows emit `WorkflowEvent` streams; plug a subscriber in to forward to your observability stack.
 
-LockChain now ships with two continuously running components:
+## Hand-off Script
 
-- **lockchain-key-usb** — a udev-backed watcher that normalises vault sticks,
-  rewrites legacy hex keys to raw bytes and mirrors them into `/run/lockchain/`
-  with strict permissions. It can run standalone or alongside the daemon.
-- **lockchain-daemon** — a Tokio service that loads configuration, creates a
-  `LockchainService<SystemZfsProvider>`, and performs scheduled unlock attempts
-  for the target datasets. It exposes a minimal HTTP health endpoint (default
-  `127.0.0.1:8787`) returning `OK` / `DEGRADED`, ready for consumption by systemd
-  health checks or external monitors.
+For implementation hand-offs:
 
-The daemon will eventually subscribe directly to USB events from
-`lockchain-key-usb` via shared crates; today it broadcasts health by marking the
-state ready once a watcher is active and successful unlocks occur. This design
-keeps the core logic reusable while enabling future RPC or REST entry points.
+1. Pair this brief with the configuration schema (`lockchain-cli validate --schema`).  
+2. Reference `.github/workflows/release.yml` to show the CI/CD path and packaging guarantees.  
+3. Encourage teams to run the Control Deck “Doctor” directive on staging nodes before sign-off.  
+4. Highlight the structured log format and `LCxxxx` codes for integration with monitoring systems.
+
+That’s the architecture: modular, observable, and ready for real-world deployments.

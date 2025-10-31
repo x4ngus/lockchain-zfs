@@ -8,7 +8,9 @@ if ! id -u lockchain >/dev/null 2>&1; then
     --gid lockchain lockchain
 fi
 install -d -o lockchain -g lockchain /var/lib/lockchain || true
+install -d -m 0755 /run/lockchain || true
 
 update-initramfs -u || true
 systemctl daemon-reload || true
 systemctl enable lockchain-zfs.service || true
+systemctl enable lockchain-key-usb.service || true

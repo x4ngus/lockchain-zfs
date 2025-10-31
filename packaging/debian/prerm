@@ -3,3 +3,5 @@ set -e
 echo "Removing LockChain ZFS..."
 systemctl stop lockchain-zfs.service || true
 systemctl disable lockchain-zfs.service || true
+systemctl stop lockchain-key-usb.service || true
+systemctl disable lockchain-key-usb.service || true

@@ -1,3 +1,5 @@
+//! Minimal terminal UI for unlocking datasets when you prefer arrow keys over shells.
+
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -25,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Fire up the TUI with shared config/service references.
 pub fn launch(
     config: Arc<LockchainConfig>,
     service: LockchainService<SystemZfsProvider>,
@@ -33,6 +36,7 @@ pub fn launch(
     app.run()
 }
 
+/// Encapsulates TUI state, list data, and last operation outcome.
 struct App {
     service: LockchainService<SystemZfsProvider>,
     datasets: Vec<DatasetKeyDescriptor>,
@@ -44,6 +48,7 @@ struct App {
 }
 
 impl App {
+    /// Hydrate the dataset list and stash service handles for later use.
     fn new(config: Arc<LockchainConfig>, service: LockchainService<SystemZfsProvider>) -> Self {
         let datasets = service.list_keys().unwrap_or_default();
 
@@ -60,6 +65,7 @@ impl App {
         }
     }
 
+    /// Enter the alternate screen, start the event loop, and clean up on exit.
     fn run(&mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -80,6 +86,7 @@ impl App {
         res
     }
 
+    /// Render the UI and react to keyboard events until the user quits.
     fn event_loop(
         &mut self,
         terminal: &mut Terminal<ratatui::backend::CrosstermBackend<Stdout>>,
@@ -138,6 +145,7 @@ impl App {
         }
     }
 
+    /// Reload keystatus from the service and keep selection stable.
     fn refresh_status(&mut self) -> Result<()> {
         self.datasets = self.service.list_keys()?;
         if !self.datasets.is_empty() {
@@ -148,6 +156,7 @@ impl App {
         Ok(())
     }
 
+    /// Kick off an unlock using the current selection and strict flag.
     fn attempt_unlock(&mut self) -> Result<()> {
         if self.datasets.is_empty() {
             self.last_error = Some("No datasets configured".into());
@@ -182,6 +191,7 @@ impl App {
         Ok(())
     }
 
+    /// Temporarily drop raw mode, prompt for a passphrase, and retry the unlock.
     fn prompt_and_unlock(&mut self) -> Result<()> {
         if self.datasets.is_empty() {
             self.last_error = Some("No datasets configured".into());
@@ -223,11 +233,13 @@ impl App {
         Ok(())
     }
 
+    /// Update the transient footer message and reset its timer.
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some(msg.into());
         self.status_timestamp = Instant::now();
     }
 
+    /// Draw the header, dataset list, and status footer in each frame.
     fn render(&self, f: &mut Frame<'_>) {
         let size = f.size();
         let chunks = Layout::default()

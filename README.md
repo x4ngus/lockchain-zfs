@@ -1,55 +1,49 @@
-![CI (Ubuntu 25.10+, Rust)][def]
-
 <div align="center">
 
 # LockChain ZFS  
-_Neon-grade crypto orchestration for your datasets._
+_Security lighting rig for encrypted storage._
 
 </div>
 
-## Signal Beacon
+## System Overview
 
-- **Status:** ![CI (Ubuntu 25.10+, Rust)][def]  
-- **Rust edition:** 2021  
-- **Core coverage target:** ≥ 70% (`cargo tarpaulin --workspace --ignore-tests`)  
-- **Docs:** cyberpunk-flavoured, but production ready. Start at [`docs/`](docs) or the ADR log.
+- **Objective**: Deliver a unique unlock workflow for encrypted ZFS datasets.  
+- **Surfaces**: CLI, daemon, UI, and USB watcher all route through the same workflow engine.  
+- **Status**: ![CI (Ubuntu 25.10+, Rust)][def] · Rust 2021
 
-## Night City Quickstart
+LockChain allows an improved interaction with encrypted file system, without trivialising your security posture.
+
+## Quick Start Guide
 
 ```bash
 # 1. Fetch the repo and toolchains
 git clone https://github.com/x4ngus/lockchain-zfs.git
 cd lockchain-zfs
 
-# 2. Run the smoke test (simulated pool, no root required)
+# 2. Run the glow-test (fake zfs provider, no root)
 cargo test -p lockchain-zfs --test unlock_smoke
 
-# 3. Wire up your config
-sudo install -m 640 packaging/systemd/lockchain-zfs.toml /etc/lockchain-zfs.toml
+# 3. Stage a config the team can read
+sudo install -Dm640 packaging/systemd/lockchain-zfs.toml /etc/lockchain-zfs.toml
 
-# 4. Bring neon online
+# 4. Trigger the unlock sequence
 cargo run -p lockchain-cli -- unlock
 ```
 
-Want richer UX? Plug in `lockchain-key-usb` to monitor the vault stick and pipe alerts through your own stack.
+For a full control room perspective, point the Control Deck (`lockchain-ui`) at the same config or have `lockchain-key-usb` enforce key presence.
+Follow up with `lockchain doctor` or `lockchain repair` to install the mount/unlock units and refresh system dependencies on your host.
 
-### Privilege Model
-
-- All services ship with a dedicated `lockchain` user/group. Packaging helpers create it automatically (`packaging/install-systemd.sh`).
-- Configuration files should be readable by that group (`sudo chgrp lockchain /etc/lockchain-zfs.toml && sudo chmod 640 …`).
-- Delegate only the required ZFS verbs or add a minimal sudoers drop-in (see `docs/SECURITY.md`).
-- Run `lockchain-ui` and any bespoke tooling as the `lockchain` user to avoid surprise sudo escalations.
-
-## The Stack
+## Module Lineup
 
 | Module | Purpose | Notes |
 | --- | --- | --- |
-| `lockchain-core` | Config, service orchestration, provider contract | Houses the key loader, checksum enforcement, logging bootstrapper |
-| `lockchain-zfs` | System provider riding the native `zfs`/`zpool` CLIs | Integration tests simulate a dev pool via Python stubs |
-| `lockchain-cli` | Ops console for unlock/status/list flows | JSON logging toggle via `LOCKCHAIN_LOG_FORMAT` |
-| `lockchain-key-usb` | udev listener + key normaliser | Watches for configured label/UUID, rewrites legacy hex → raw |
-| `lockchain-daemon` | Long-running orchestrator (USB + unlock cadence + health) | Tokio service with `/health` endpoint, consumes `lockchain-core` + `lockchain-zfs` |
-| `docs/adr` | Architecture Decision Records | ADR-001 explains the module/provider split |
+| `lockchain-core` | Policy engine, workflow orchestration, ZFS provider contract | Houses keyfile guards, checksum enforcement, JSON logging bootstrap |
+| `lockchain-zfs` | System provider using native `zfs`/`zpool` binaries | Maps exit codes, parses stdout, backs the unlock smoke test |
+| `lockchain-cli` | Operator console (unlock/status/list/validate/breakglass) | Structured error codes for SIEM correlation (`LCxxxx`) |
+| `lockchain-key-usb` | udev watcher & key normaliser | Detects label/UUID, rewrites legacy hex → raw, mirrors to `/run/lockchain/` |
+| `lockchain-daemon` | Long-running safety net | Watches USB, retries unlocks, runs health responder (`127.0.0.1:8787`) |
+| `lockchain-ui` | Iced Control Deck | Keyboard-first TUI with directives for forge, self-test, doctor |
+| `docs/adr` | Architecture Decisions | ADR-001 captures the provider strategy |
 
 ## Configuration Blueprint
 
@@ -85,50 +79,48 @@ max_delay_ms = 5000
 jitter_ratio = 0.1
 ```
 
-- Leave `zfs_path`/`zpool_path` unset to auto-discover common locations.  
-- `device_label` / `device_uuid` lock the USB watcher onto the correct token.  
-- `device_key_path` identifies the payload inside the mounted volume.  
-- `mount_timeout_secs` controls how long we wait for `/proc/mounts` to expose the stick after insertion.
-- `retry` tunes exponential backoff for unlock attempts (daemon/TUI/CLI reuse the same policy).
+**Environment Overrides**
 
-**Environment overrides**
+| Variable | Intent | Effect |
+| --- | --- | --- |
+| `LOCKCHAIN_KEY_PATH` | Point to alternate key material | Overrides `usb.key_hex_path`. |
+| `LOCKCHAIN_LOG_LEVEL` | Adjust verbosity | Default log filter (`info`). |
+| `LOCKCHAIN_LOG_FORMAT` | Switch between JSON/plain logs | `json` (default) or `plain`. |
+| `LOCKCHAIN_KEY_USB_MOUNTS_PATH` | Provide a mounts fixture for testing | Feeds the USB watcher with synthetic data. |
+| `LOCKCHAIN_CONFIG` | Run a surface against a different config | Daemon + watcher default to `/etc/lockchain-zfs.toml`. |
+| `LOCKCHAIN_HEALTH_ADDR` | Rebind the daemon health endpoint | Default `127.0.0.1:8787`. |
 
-| Variable | Effect |
-| --- | --- |
-| `LOCKCHAIN_KEY_PATH` | Replaces `usb.key_hex_path` (handy for tests or when systemd drops the file elsewhere) |
-| `LOCKCHAIN_LOG_LEVEL` | Default log filter (`info` unless overridden) |
-| `LOCKCHAIN_LOG_FORMAT` | `json` (default) or `plain` |
-| `LOCKCHAIN_KEY_USB_MOUNTS_PATH` | Test-only override for the mount table when driving the USB watcher |
-| `LOCKCHAIN_CONFIG` | Path override used by the daemon and USB watcher (`/etc/lockchain-zfs.toml` default) |
-| `LOCKCHAIN_HEALTH_ADDR` | Bind address for the daemon’s health endpoint (`127.0.0.1:8787`) |
+## Console Commands
 
-## Operator Moves
+- `lockchain init --dataset <ds>` — forge or refresh the USB token, rebuild dracut, and capture checksum updates.  
+- `lockchain doctor` — run diagnostics with automatic remediation for config, systemd, and initramfs.  
+- `lockchain repair` — reinstall/enable mount and unlock units when doctor suggests manual action.  
+- `lockchain unlock --strict-usb` — require the vault stick; no silent fallbacks.  
+- `lockchain self-test` — exercise an ephemeral pool to prove the current key still opens the vault.  
+- `lockchain unlock --prompt-passphrase` — partner with `systemd-ask-password` when policy allows.  
+- `lockchain status` — live keystatus for every dataset in `policy.datasets`.  
+- `lockchain list-keys` — report encryption roots vs. datasets.  
+- `lockchain-key-usb` — enforce USB insertion/removal rules, heal legacy key files.  
+- `lockchain tui` — keyboard-only Control Deck for datasets, retries, and passphrases.  
+- `lockchain validate -f /path/to/config` — static validator; `--schema` exports the JSON schema.  
+- `lockchain-daemon` — schedule unlock attempts, stream health, surface warnings.  
 
-- `lockchain unlock --strict-usb` — refuse fallback paths, require the vault stick.  
-- `lockchain unlock --prompt-passphrase` — call out to `systemd-ask-password` using the configured XOR blob.  
-- `lockchain status` — get the live keystatus for every dataset in `policy.datasets`.  
-- `lockchain list-keys` — friendly table showing dataset ↔ encryption root ↔ status.  
-- `lockchain-key-usb` — run as a service to enforce USB key rotation and rewrite legacy hex files in-place.
-- `lockchain tui` — keyboard-only interface for browsing datasets, unlocking with retries, and supplying passphrases on the fly.
-- `lockchain validate -f /path/to/config` — run the static validator; `--schema` prints the JSON schema consumed by tooling.
-- `lockchain-daemon` — supervise USB events, schedule unlock attempts, and expose health for your orchestrator (`cargo run -p lockchain-daemon`).
-- Errors across binaries include `[LCxxxx]` codes; log collectors can pivot off the `LC` namespace for automated triage.
+All surfaces emit machine-readable error codes prefixed with `LC`, making SOC integration straightforward.
 
-## Building in the Glow
+## Build & Quality Gates
 
-- `cargo test -p lockchain-core` — high coverage target, includes keyfile and service guard-rails.  
-- `cargo test -p lockchain-zfs` — includes the unlock smoke test backed by fake binaries.  
-- `cargo test -p lockchain-key-usb` — requires `libudev-dev` (or equivalent) to compile.  
-- `cargo fmt && cargo clippy --all-targets` — standard hygiene checks.
+- `cargo test -p lockchain-core` — keyfile, workflow, and fallback coverage.  
+- `cargo test -p lockchain-zfs` — unlock smoke test with fake binaries.  
+- `cargo test -p lockchain-key-usb` — requires `libudev-dev`.  
+- `cargo fmt && cargo clippy --all-targets` — routine hygiene.  
+- Packaging pipeline (`.github/workflows/release.yml`) builds signed `.deb` releases on Ubuntu 25.10+.
 
-See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for the full build + review protocol and [`docs/SECURITY.md`](docs/SECURITY.md) for vuln reporting.
+## Further Reading
 
-## Lore Drops
-
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — higher-level overview of the service boundaries.  
-- [`docs/adr/ADR-001-module-provider.md`](docs/adr/ADR-001-module-provider.md) — why we double down on the provider abstraction.  
-- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — playbook for rough nights.
-
-Stay sharp, keep your datasets encrypted, and enjoy the glow.
+- [`docs/INSTALL.md`](docs/INSTALL.md) — deployment runbook for operations and platform teams.  
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — component map and integration touchpoints.  
+- [`docs/SECURITY.md`](docs/SECURITY.md) — hardening posture, disclosure process, break-glass guardrails.  
+- [`docs/RELEASE.md`](docs/RELEASE.md) — how we ship signed packages.  
+- [`docs/adr/ADR-001-module-provider.md`](docs/adr/ADR-001-module-provider.md) — strategy memo on the provider abstraction.
 
 [def]: https://github.com/x4ngus/lockchain-zfs/actions/workflows/ci.yml/badge.svg
